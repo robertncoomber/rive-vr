@@ -64,6 +64,9 @@ constexpr float kQuadMeters = 0.8f;
 constexpr float kQuadDistance = 1.2f;
 
 const char* kEyeProps[2] = {"eyeL", "eyeR"};
+const char* kHandSuffix[2] = {"L", "R"};
+const char* kHandPaths[2] = {"/user/hand/left", "/user/hand/right"};
+const char* kControllerPoseKeys[7] = {"px", "py", "pz", "qx", "qy", "qz", "qw"};
 const char* kPoseKeys[11] =
     {"px", "py", "pz", "qx", "qy", "qz", "qw", "fovL", "fovR", "fovU", "fovD"};
 
@@ -143,6 +146,15 @@ struct App
     XrSession session = XR_NULL_HANDLE;
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSpace stageSpace = XR_NULL_HANDLE;
+
+    // Controller input: one action set, grip/aim poses and trigger per hand.
+    XrActionSet actionSet = XR_NULL_HANDLE;
+    XrAction gripAction = XR_NULL_HANDLE;
+    XrAction aimAction = XR_NULL_HANDLE;
+    XrAction triggerAction = XR_NULL_HANDLE;
+    XrPath handPaths[2] = {XR_NULL_PATH, XR_NULL_PATH};
+    XrSpace gripSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrSwapchain swapchain = XR_NULL_HANDLE;
     uint32_t swapchainWidth = 0;
     uint32_t swapchainHeight = 0;
@@ -171,6 +183,9 @@ struct App
     rive::ViewModelInstanceNumberRuntime* seenFrameProp = nullptr;
     rive::ViewModelInstanceNumberRuntime* eyeWidthProp = nullptr;
     rive::ViewModelInstanceNumberRuntime* eyeHeightProp = nullptr;
+    // [hand][0..6] grip pose, [hand][7..13] aim pose, [hand][14] trigger,
+    // [hand][15] active (1 when the controller is tracked).
+    rive::ViewModelInstanceNumberRuntime* handProps[2][16] = {};
 
     // G4: frames where the script drew with a stale frameIndex.
     uint64_t g4Frames = 0;
@@ -253,6 +268,75 @@ bool initEGL(App& app)
     return true;
 }
 
+bool initInput(App& app)
+{
+    for (int hand = 0; hand < 2; ++hand)
+    {
+        XR_CHECK(
+            xrStringToPath(app.instance, kHandPaths[hand], &app.handPaths[hand]));
+    }
+
+    XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+    strcpy(setInfo.actionSetName, "main");
+    strcpy(setInfo.localizedActionSetName, "Main");
+    XR_CHECK(xrCreateActionSet(app.instance, &setInfo, &app.actionSet));
+
+    auto makeAction = [&](const char* name, XrActionType type, XrAction* out) {
+        XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+        info.actionType = type;
+        strcpy(info.actionName, name);
+        strcpy(info.localizedActionName, name);
+        info.countSubactionPaths = 2;
+        info.subactionPaths = app.handPaths;
+        return xrCreateAction(app.actionSet, &info, out);
+    };
+    XR_CHECK(makeAction("grip_pose", XR_ACTION_TYPE_POSE_INPUT, &app.gripAction));
+    XR_CHECK(makeAction("aim_pose", XR_ACTION_TYPE_POSE_INPUT, &app.aimAction));
+    XR_CHECK(
+        makeAction("trigger", XR_ACTION_TYPE_FLOAT_INPUT, &app.triggerAction));
+
+    auto path = [&](const char* str) {
+        XrPath p = XR_NULL_PATH;
+        xrStringToPath(app.instance, str, &p);
+        return p;
+    };
+    const XrActionSuggestedBinding bindings[] = {
+        {app.gripAction, path("/user/hand/left/input/grip/pose")},
+        {app.gripAction, path("/user/hand/right/input/grip/pose")},
+        {app.aimAction, path("/user/hand/left/input/aim/pose")},
+        {app.aimAction, path("/user/hand/right/input/aim/pose")},
+        {app.triggerAction, path("/user/hand/left/input/trigger/value")},
+        {app.triggerAction, path("/user/hand/right/input/trigger/value")},
+    };
+    XrInteractionProfileSuggestedBinding suggested{
+        XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    suggested.interactionProfile =
+        path("/interaction_profiles/oculus/touch_controller");
+    suggested.countSuggestedBindings =
+        sizeof(bindings) / sizeof(bindings[0]);
+    suggested.suggestedBindings = bindings;
+    XR_CHECK(xrSuggestInteractionProfileBindings(app.instance, &suggested));
+
+    for (int hand = 0; hand < 2; ++hand)
+    {
+        XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        spaceInfo.subactionPath = app.handPaths[hand];
+        spaceInfo.poseInActionSpace.orientation.w = 1.0f;
+        spaceInfo.action = app.gripAction;
+        XR_CHECK(
+            xrCreateActionSpace(app.session, &spaceInfo, &app.gripSpaces[hand]));
+        spaceInfo.action = app.aimAction;
+        XR_CHECK(
+            xrCreateActionSpace(app.session, &spaceInfo, &app.aimSpaces[hand]));
+    }
+
+    XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &app.actionSet;
+    XR_CHECK(xrAttachSessionActionSets(app.session, &attach));
+    return true;
+}
+
 bool initOpenXR(App& app)
 {
     PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
@@ -322,6 +406,10 @@ bool initOpenXR(App& app)
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
     XR_CHECK(xrCreateReferenceSpace(app.session, &spaceInfo, &app.localSpace));
+    if (!initInput(app))
+    {
+        return false;
+    }
 
     // Floor-level space for the stereo scene (y = 0 is the floor).
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
@@ -525,6 +613,21 @@ bool initRive(App& app)
         app.seenFrameProp = app.viewModel->propertyNumber("seenFrame");
         app.eyeWidthProp = app.viewModel->propertyNumber("eyeWidth");
         app.eyeHeightProp = app.viewModel->propertyNumber("eyeHeight");
+        for (int hand = 0; hand < 2; ++hand)
+        {
+            const std::string h = kHandSuffix[hand];
+            for (int k = 0; k < 7; ++k)
+            {
+                app.handProps[hand][k] = app.viewModel->propertyNumber(
+                    "grip" + h + "_" + kControllerPoseKeys[k]);
+                app.handProps[hand][7 + k] = app.viewModel->propertyNumber(
+                    "aim" + h + "_" + kControllerPoseKeys[k]);
+            }
+            app.handProps[hand][14] =
+                app.viewModel->propertyNumber("trigger" + h);
+            app.handProps[hand][15] =
+                app.viewModel->propertyNumber("active" + h);
+        }
         if (app.eyeWidthProp)
             app.eyeWidthProp->value((float)app.eyeWidth);
         if (app.eyeHeightProp)
@@ -596,6 +699,67 @@ void pollXrEvents(App& app)
 // Locates both eyes at the predicted display time and writes them into the
 // XR ViewModel before the state machine advances, so this frame's draw uses
 // this frame's poses. Returns false when tracking has no valid pose.
+void setProp(rive::ViewModelInstanceNumberRuntime* prop, float value)
+{
+    if (prop != nullptr)
+    {
+        prop->value(value);
+    }
+}
+
+// Syncs controller input and writes grip/aim poses and trigger values into
+// the XR ViewModel, located at the same display time and space as the eyes.
+void writeControllers(App& app, XrTime displayTime)
+{
+    XrActiveActionSet active{app.actionSet, XR_NULL_PATH};
+    XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
+    syncInfo.countActiveActionSets = 1;
+    syncInfo.activeActionSets = &active;
+    xrSyncActions(app.session, &syncInfo);
+
+    for (int hand = 0; hand < 2; ++hand)
+    {
+        XrSpaceLocation grip{XR_TYPE_SPACE_LOCATION};
+        XrSpaceLocation aim{XR_TYPE_SPACE_LOCATION};
+        xrLocateSpace(app.gripSpaces[hand], app.stageSpace, displayTime, &grip);
+        xrLocateSpace(app.aimSpaces[hand], app.stageSpace, displayTime, &aim);
+        const XrSpaceLocationFlags required =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT |
+            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        const bool tracked = (grip.locationFlags & required) == required &&
+                             (aim.locationFlags & required) == required;
+        setProp(app.handProps[hand][15], tracked ? 1.0f : 0.0f);
+        if (!tracked)
+        {
+            continue;
+        }
+        const XrPosef* poses[2] = {&grip.pose, &aim.pose};
+        for (int p = 0; p < 2; ++p)
+        {
+            const XrPosef& pose = *poses[p];
+            const float values[7] = {pose.position.x,
+                                     pose.position.y,
+                                     pose.position.z,
+                                     pose.orientation.x,
+                                     pose.orientation.y,
+                                     pose.orientation.z,
+                                     pose.orientation.w};
+            for (int k = 0; k < 7; ++k)
+            {
+                setProp(app.handProps[hand][p * 7 + k], values[k]);
+            }
+        }
+
+        XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+        getInfo.action = app.triggerAction;
+        getInfo.subactionPath = app.handPaths[hand];
+        XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT};
+        xrGetActionStateFloat(app.session, &getInfo, &trigger);
+        setProp(app.handProps[hand][14],
+                trigger.isActive ? trigger.currentState : 0.0f);
+    }
+}
+
 bool writeEyePoses(App& app, XrTime displayTime)
 {
     XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
@@ -733,6 +897,7 @@ void renderFrame(App& app)
         if (app.stereo)
         {
             posesValid = writeEyePoses(app, frameState.predictedDisplayTime);
+            writeControllers(app, frameState.predictedDisplayTime);
         }
 
         recordRive(app, dt);
@@ -821,11 +986,22 @@ void renderFrame(App& app)
         std::chrono::duration<double>(now - app.secondStart).count();
     if (elapsed >= 1.0)
     {
-        LOGI("fps=%.1f rive cpu=%.2fms/frame g4 stale=%llu/%llu",
+        auto handState = [&](int hand) {
+            auto* active = app.handProps[hand][15];
+            auto* trigger = app.handProps[hand][14];
+            auto* y = app.handProps[hand][1];
+            return std::string(active && active->value() > 0.5f ? "on" : "off") +
+                   " y=" + std::to_string(y ? y->value() : 0.0f).substr(0, 4) +
+                   " trig=" +
+                   std::to_string(trigger ? trigger->value() : 0.0f).substr(0, 4);
+        };
+        LOGI("fps=%.1f rive cpu=%.2fms/frame g4 stale=%llu/%llu | L %s | R %s",
              app.framesThisSecond / elapsed,
              app.cpuMsThisSecond / app.framesThisSecond,
              (unsigned long long)app.g4Stale,
-             (unsigned long long)app.g4Frames);
+             (unsigned long long)app.g4Frames,
+             handState(0).c_str(),
+             handState(1).c_str());
         app.framesThisSecond = 0;
         app.cpuMsThisSecond = 0;
         app.secondStart = now;
