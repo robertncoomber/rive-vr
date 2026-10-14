@@ -63,6 +63,21 @@ local OBJECTS: { Obj } = {
 }
 local CONTROLLER_DRAWS = 4 -- box L, ray L, box R, ray R
 
+-- Multiplayer: the host broadcasts our head and hands on the local network
+-- and writes up to REMOTE_SLOTS other players (already interpolated) into
+-- the XR ViewModel. Each is drawn as a coloured head with a visor and two
+-- hand cubes.
+local REMOTE_SLOTS = 4
+local REMOTE_DRAWS = 4 -- head, visor, hand L, hand R
+local HEAD_SIZE: { number } = { 0.2, 0.2, 0.22 }
+local VISOR_SIZE: { number } = { 0.16, 0.06, 0.03 }
+local REMOTE_HAND_SIZE = 0.08
+local PLAYER_COLOURS: { { number } } = {
+  { 0.95, 0.45, 0.25 }, { 0.3, 0.75, 0.95 }, { 0.6, 0.9, 0.35 }, { 0.95, 0.8, 0.25 },
+  { 0.85, 0.4, 0.85 }, { 0.35, 0.9, 0.75 }, { 0.95, 0.55, 0.6 }, { 0.6, 0.6, 0.95 },
+}
+local POSE_KEYS: { string } = { 'px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw' }
+
 type Hand = { touching: boolean, ready: boolean, x: number, y: number, z: number }
 
 type VRScene = {
@@ -104,6 +119,20 @@ for _, hand in { 'L', 'R' } do
   end
   table.insert(PROP_NAMES, 'trigger' .. hand)
   table.insert(PROP_NAMES, 'active' .. hand)
+end
+for _, part in { 'netHead', 'netHandL', 'netHandR' } do
+  for _, k in POSE_KEYS do
+    table.insert(PROP_NAMES, part .. '_' .. k)
+  end
+end
+for slot = 1, REMOTE_SLOTS do
+  table.insert(PROP_NAMES, 'p' .. slot .. '_active')
+  table.insert(PROP_NAMES, 'p' .. slot .. '_color')
+  for _, part in { 'head', 'handL', 'handR' } do
+    for _, k in POSE_KEYS do
+      table.insert(PROP_NAMES, 'p' .. slot .. '_' .. part .. '_' .. k)
+    end
+  end
 end
 
 -- ---------------------------------------------------------------- geometry
@@ -489,7 +518,7 @@ local function makeEye(self: VRScene, w: number, h: number, withCanvas: boolean)
     groups = {},
   }
   local pipeline = self.pipeline :: GPUPipeline
-  for _ = 1, #OBJECTS + CONTROLLER_DRAWS do
+  for _ = 1, #OBJECTS + CONTROLLER_DRAWS + REMOTE_SLOTS * REMOTE_DRAWS do
     local ubo = GPUBuffer.new({ size = UBO_SIZE, usage = 'uniform' })
     table.insert(eye.ubos, ubo)
     table.insert(eye.groups, GPUBindGroup.new({
@@ -564,8 +593,43 @@ function init(self: VRScene, context: Context): boolean
   return true
 end
 
+local function setNum(self: VRScene, name: string, value: number)
+  local p = self.props[name]
+  if p then
+    p.value = value
+  end
+end
+
+-- Our world-space head (between the eyes) and hands, for the host to send.
+-- A touching hand reports where it touches, matching what we draw.
+local function publishPose(self: VRScene)
+  local function write(part: string, x: number, y: number, z: number, q: string)
+    setNum(self, part .. '_px', x)
+    setNum(self, part .. '_py', y)
+    setNum(self, part .. '_pz', z)
+    for _, k in { 'qx', 'qy', 'qz', 'qw' } do
+      setNum(self, part .. '_' .. k, num(self, q .. k))
+    end
+  end
+  local lx, ly, lz = poseOf(self, 'eyeL_')
+  local rx, ry, rz = poseOf(self, 'eyeR_')
+  write('netHead', (lx + rx) / 2, (ly + ry) / 2, (lz + rz) / 2, 'eyeL_')
+  for h, hand in { 'L', 'R' } do
+    local x, y, z = poseOf(self, 'grip' .. hand .. '_')
+    local st = self.hands[h]
+    if st.touching then
+      x, y, z = st.x, st.y, st.z
+    end
+    if num(self, 'active' .. hand) < 0.5 then
+      x, y, z = 0, -100, 0 -- hidden
+    end
+    write('netHand' .. hand, x, y, z, 'grip' .. hand .. '_')
+  end
+end
+
 function advance(self: VRScene, seconds: number): boolean
   locomote(self, seconds)
+  publishPose(self)
   return true
 end
 
@@ -577,8 +641,16 @@ local function writeMat(b: buffer, offset: number, m: { number })
   end
 end
 
--- Writes this eye's uniforms; returns the hands to draw.
-local function prepareEye(self: VRScene, eye: Eye, prefix: string): { number }
+type EyeDraws = { hands: { number }, remotes: { number } }
+
+local function remotePose(self: VRScene, prefix: string): (number, number, number, { { number } })
+  return num(self, prefix .. 'px'), num(self, prefix .. 'py'), num(self, prefix .. 'pz'),
+    quatRows(num(self, prefix .. 'qx'), num(self, prefix .. 'qy'),
+             num(self, prefix .. 'qz'), num(self, prefix .. 'qw'))
+end
+
+-- Writes this eye's uniforms; returns which hands and remote players to draw.
+local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
   local ex, ey, ez, er = poseOf(self, prefix .. '_')
   local proj = projection(
     num(self, prefix .. '_fovL'), num(self, prefix .. '_fovR'),
@@ -633,11 +705,36 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): { number }
         0.45 + 0.55 * t, 0.75 + 0.25 * t, 1, 2)
     end
   end
-  return activeHands
+
+  -- Remote players: head + visor + hands, coloured by their id.
+  local remotes: { number } = {}
+  for slot = 1, REMOTE_SLOTS do
+    local p = 'p' .. slot .. '_'
+    if num(self, p .. 'active') > 0.5 then
+      table.insert(remotes, slot)
+      local c = PLAYER_COLOURS[math.floor(num(self, p .. 'color')) % #PLAYER_COLOURS + 1]
+      local base = #OBJECTS + CONTROLLER_DRAWS + (slot - 1) * REMOTE_DRAWS
+      local hx, hy, hz, hr = remotePose(self, p .. 'head_')
+      writeDraw(eye.ubos[base + 1],
+        poseModel(hx, hy, hz, hr, HEAD_SIZE[1], HEAD_SIZE[2], HEAD_SIZE[3], 0, 0, 0),
+        c[1], c[2], c[3], 0)
+      writeDraw(eye.ubos[base + 2],
+        poseModel(hx, hy, hz, hr, VISOR_SIZE[1], VISOR_SIZE[2], VISOR_SIZE[3], 0, 0.02, -0.11),
+        0.06, 0.07, 0.09, 0)
+      for i, part in { 'handL_', 'handR_' } do
+        local x, y, z, r = remotePose(self, p .. part)
+        writeDraw(eye.ubos[base + 2 + i],
+          poseModel(x, y, z, r, REMOTE_HAND_SIZE, REMOTE_HAND_SIZE, REMOTE_HAND_SIZE, 0, 0, 0),
+          c[1] * 0.8, c[2] * 0.8, c[3] * 0.8, 0)
+      end
+    end
+  end
+  return { hands = activeHands, remotes = remotes }
 end
 
 -- Issues one eye's draws into an open pass.
-local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, activeHands: { number })
+local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, d: EyeDraws)
+  local activeHands = d.hands
   pass:setPipeline(self.pipeline :: GPUPipeline)
   for i, o in OBJECTS do
     pass:setBindGroup(0, eye.groups[i])
@@ -655,6 +752,13 @@ local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, activeHan
     pass:draw(36)
     pass:setBindGroup(0, eye.groups[#OBJECTS + (h - 1) * 2 + 2])
     pass:draw(36)
+  end
+  for _, slot in d.remotes do
+    local base = #OBJECTS + CONTROLLER_DRAWS + (slot - 1) * REMOTE_DRAWS
+    for i = 1, REMOTE_DRAWS do
+      pass:setBindGroup(0, eye.groups[base + i])
+      pass:draw(36)
+    end
   end
 end
 

@@ -25,7 +25,7 @@ add_library(openxr_loader SHARED IMPORTED)
 set_target_properties(openxr_loader PROPERTIES
     IMPORTED_LOCATION ${OPENXR}/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so)
 
-add_library(main SHARED ${ROOT}/src/main.cpp)
+add_library(main SHARED ${ROOT}/src/main.cpp ${ROOT}/src/net.cpp)
 target_compile_definitions(main PRIVATE ${RIVE_DEFINES})
 target_compile_options(main PRIVATE -flto -fno-exceptions -fno-rtti
     -include ${RIVE}/scripting/rive_luau.hpp)

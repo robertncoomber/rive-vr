@@ -37,6 +37,8 @@
 #include "rive/viewmodel/runtime/viewmodel_instance_runtime.hpp"
 #include "rive/viewmodel/runtime/viewmodel_runtime.hpp"
 
+#include "net.hpp"
+
 #include <chrono>
 #include <pthread.h>
 #include <unistd.h>
@@ -71,6 +73,9 @@ const char* kEyeProps[2] = {"eyeL", "eyeR"};
 const char* kHandSuffix[2] = {"L", "R"};
 const char* kHandPaths[2] = {"/user/hand/left", "/user/hand/right"};
 const char* kControllerPoseKeys[7] = {"px", "py", "pz", "qx", "qy", "qz", "qw"};
+const char* kNetParts[3] = {"Head", "HandL", "HandR"};
+const char* kRemoteParts[3] = {"head", "handL", "handR"};
+constexpr int kRemoteSlots = 4;
 const char* kPoseKeys[11] =
     {"px", "py", "pz", "qx", "qy", "qz", "qw", "fovL", "fovR", "fovU", "fovD"};
 
@@ -201,6 +206,14 @@ struct App
     // [hand][0..6] grip pose, [hand][7..13] aim pose, [hand][14] trigger,
     // [hand][15] active (1 when the controller is tracked).
     rive::ViewModelInstanceNumberRuntime* handProps[2][16] = {};
+
+    // Multiplayer: our pose out (21), and per remote slot: active, color,
+    // then head/handL/handR poses (21).
+    LanSession lan;
+    bool lanUp = false;
+    rive::ViewModelInstanceNumberRuntime* netOut[21] = {};
+    rive::ViewModelInstanceNumberRuntime* remoteProps[kRemoteSlots][23] = {};
+    jobject multicastLock = nullptr;
 
     // G4: frames where the script drew with a stale frameIndex.
     uint64_t g4Frames = 0;
@@ -747,6 +760,38 @@ bool initRive(App& app)
             app.eyeWidthProp->value((float)app.eyeWidth);
         if (app.eyeHeightProp)
             app.eyeHeightProp->value((float)app.eyeHeight);
+        for (int part = 0; part < 3; ++part)
+        {
+            for (int k = 0; k < 7; ++k)
+            {
+                app.netOut[part * 7 + k] = app.viewModel->propertyNumber(
+                    std::string("net") + kNetParts[part] + "_" + kControllerPoseKeys[k]);
+            }
+        }
+        for (int slot = 0; slot < kRemoteSlots; ++slot)
+        {
+            const std::string p = "p" + std::to_string(slot + 1) + "_";
+            app.remoteProps[slot][0] = app.viewModel->propertyNumber(p + "active");
+            app.remoteProps[slot][1] = app.viewModel->propertyNumber(p + "color");
+            for (int part = 0; part < 3; ++part)
+            {
+                for (int k = 0; k < 7; ++k)
+                {
+                    app.remoteProps[slot][2 + part * 7 + k] =
+                        app.viewModel->propertyNumber(p + kRemoteParts[part] + "_" +
+                                                      kControllerPoseKeys[k]);
+                }
+            }
+        }
+        int missing = 0;
+        for (auto* prop : app.netOut)
+            missing += prop == nullptr;
+        for (auto& slot : app.remoteProps)
+            for (auto* prop : slot)
+                missing += prop == nullptr;
+        LOGI("Multiplayer ViewModel properties: %d of %d missing",
+             missing,
+             21 + kRemoteSlots * 23);
         setNumber(app, "msaa", (float)app.msaa);
         setNumber(app, "direct", app.direct ? 1.0f : 0.0f);
         // The artboard is the double-wide eye image, pixel for pixel.
@@ -811,6 +856,102 @@ void pollXrEvents(App& app)
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
     }
+}
+
+void setProp(rive::ViewModelInstanceNumberRuntime* prop, float value);
+
+double monotonicSeconds()
+{
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Remote players, interpolated, into the XR ViewModel slots.
+void writeRemotePlayers(App& app)
+{
+    if (!app.lanUp)
+    {
+        return;
+    }
+    const double now = monotonicSeconds();
+    app.lan.poll(now);
+    const std::vector<RemotePlayer> players = app.lan.sample(now);
+    for (int slot = 0; slot < kRemoteSlots; ++slot)
+    {
+        const bool active = slot < (int)players.size();
+        setProp(app.remoteProps[slot][0], active ? 1.0f : 0.0f);
+        if (!active)
+        {
+            continue;
+        }
+        setProp(app.remoteProps[slot][1], (float)(players[slot].id % 8));
+        for (int i = 0; i < 21; ++i)
+        {
+            setProp(app.remoteProps[slot][2 + i], players[slot].pose.v[i]);
+        }
+    }
+}
+
+// Our world pose, as the script published it this frame, to everyone.
+void sendLocalPose(App& app)
+{
+    if (!app.lanUp)
+    {
+        return;
+    }
+    NetPose pose;
+    for (int i = 0; i < 21; ++i)
+    {
+        pose.v[i] = app.netOut[i] != nullptr ? app.netOut[i]->value() : 0.0f;
+    }
+    app.lan.send(pose);
+}
+
+// Android filters incoming broadcast/multicast on Wi-Fi unless an app holds a
+// WifiManager.MulticastLock, which is only reachable through Java.
+jobject acquireMulticastLock(android_app* android)
+{
+    JNIEnv* env = nullptr;
+    if (android->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+    {
+        return nullptr;
+    }
+    jobject activity = android->activity->clazz;
+    jclass contextClass = env->GetObjectClass(activity);
+    jmethodID getSystemService = env->GetMethodID(contextClass,
+                                                  "getSystemService",
+                                                  "(Ljava/lang/String;)Ljava/lang/Object;");
+    jstring wifiName = env->NewStringUTF("wifi");
+    jobject wifi = env->CallObjectMethod(activity, getSystemService, wifiName);
+    jobject lock = nullptr;
+    if (wifi != nullptr && !env->ExceptionCheck())
+    {
+        jclass wifiClass = env->GetObjectClass(wifi);
+        jmethodID create = env->GetMethodID(
+            wifiClass,
+            "createMulticastLock",
+            "(Ljava/lang/String;)Landroid/net/wifi/WifiManager$MulticastLock;");
+        jstring tag = env->NewStringUTF("rivevr");
+        jobject local = env->CallObjectMethod(wifi, create, tag);
+        if (local != nullptr && !env->ExceptionCheck())
+        {
+            jclass lockClass = env->GetObjectClass(local);
+            env->CallVoidMethod(local, env->GetMethodID(lockClass, "acquire", "()V"));
+            lock = env->NewGlobalRef(local);
+        }
+    }
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        LOGE("Could not acquire the Wi-Fi multicast lock");
+    }
+    else
+    {
+        LOGI("Wi-Fi multicast lock held");
+    }
+    return lock;
 }
 
 // Locates both eyes at the predicted display time and writes them into the
@@ -1026,9 +1167,14 @@ void renderFrame(App& app)
         {
             posesValid = writeEyePoses(app, frameState.predictedDisplayTime);
             writeControllers(app, frameState.predictedDisplayTime);
+            writeRemotePlayers(app);
         }
 
         recordRive(app, dt);
+        if (app.stereo)
+        {
+            sendLocalPose(app);
+        }
 
         if (app.stereo && app.seenFrameProp != nullptr)
         {
@@ -1213,6 +1359,12 @@ void android_main(android_app* android)
         ANativeActivity_finish(android->activity);
     }
 
+    if (app.stereo)
+    {
+        app.multicastLock = acquireMulticastLock(android);
+        app.lanUp = app.lan.start();
+    }
+
     while (!android->destroyRequested)
     {
         const int timeout =
@@ -1235,6 +1387,7 @@ void android_main(android_app* android)
         }
     }
 
+    app.lan.stop();
     app.stateMachine.reset();
     app.artboard.reset();
     app.file = nullptr;

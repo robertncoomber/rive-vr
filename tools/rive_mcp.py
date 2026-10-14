@@ -11,6 +11,7 @@ For payloads too large to pass by hand: generated scripts and image assets.
 """
 
 import base64
+import difflib
 import json
 import mimetypes
 import os
@@ -46,6 +47,48 @@ def call(tool, arguments):
     return result['result']['content'][0]['text']
 
 
+def view_script(name):
+    text = call('text_editor', {'command': 'view', 'path': name})
+    text = json.loads(text)['content'] if text.startswith('{') else text
+    # The view appends a newline the stored script does not have; matching
+    # against it fails for any edit touching the end of the file.
+    return text.rstrip('\n')
+
+
+def sync_script(name, new):
+    """Makes the editor's script match `new`, one changed hunk at a time.
+
+    Replacing the whole file in one str_replace is not reliable in the editor,
+    so each hunk is replaced with a few lines of unchanged context around it
+    (enough to be unique), applied bottom-up so earlier offsets stay valid.
+    """
+    current = view_script(name)
+    if current.rstrip('\n') == new.rstrip('\n'):
+        call('recompile_all_scripts', {})
+        return call('script_diagnostics', {'path': name})
+    a = current.split('\n')
+    b = new.rstrip('\n').split('\n')
+    ops = [op for op in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+           if op[0] != 'equal']
+    for tag, i1, i2, j1, j2 in reversed(ops):
+        for ctx in (2, 4, 8, 16):
+            s1, e1 = max(0, i1 - ctx), min(len(a), i2 + ctx)
+            old_block = '\n'.join(a[s1:e1])
+            if old_block and current.count(old_block) == 1:
+                break
+        new_block = '\n'.join(a[s1:i1] + b[j1:j2] + a[i2:e1])
+        result = call('text_editor', {'command': 'str_replace', 'path': name,
+                                      'old_string': old_block, 'new_string': new_block})
+        if 'Error' in result:
+            sys.exit(f'hunk at line {i1 + 1} failed: {result}')
+        a[i1:i2] = b[j1:j2]
+        current = '\n'.join(a)
+    if view_script(name).rstrip('\n') != new.rstrip('\n'):
+        sys.exit('sync finished but the editor text still differs')
+    call('recompile_all_scripts', {})
+    return call('script_diagnostics', {'path': name})
+
+
 def main():
     if len(sys.argv) != 4:
         sys.exit(__doc__)
@@ -61,15 +104,8 @@ def main():
         out = call('upload_asset', {'file': f'data:{mime};name={filename};base64,{data}',
                                     'name': name})
     elif kind == 'sync':
-        current = call('text_editor', {'command': 'view', 'path': name})
-        if current.startswith('{'):
-            current = json.loads(current)['content']
         new = open(path).read()
-        if current != new:
-            call('text_editor', {'command': 'str_replace', 'path': name,
-                                 'old_string': current, 'new_string': new})
-        call('recompile_all_scripts', {})
-        out = call('script_diagnostics', {'path': name})
+        out = sync_script(name, new)
     else:
         sys.exit(__doc__)
     print(out[:2000])
