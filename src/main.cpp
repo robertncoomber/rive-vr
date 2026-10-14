@@ -169,6 +169,7 @@ struct App
     int64_t swapchainFormat = 0;
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
+    bool hasPerfSettings = false;
     bool exitRequested = false;
 
     // Rive
@@ -273,6 +274,44 @@ bool initEGL(App& app)
     return true;
 }
 
+// Requests CPU/GPU clock levels via XR_EXT_performance_settings.
+// debug.rivevr.gpulevel / debug.rivevr.cpulevel pick the level:
+// 0 power savings, 1 sustained low, 2 sustained high (default), 3 boost.
+void applyPerformanceLevels(App& app)
+{
+    if (!app.hasPerfSettings)
+    {
+        LOGI("XR_EXT_performance_settings not available");
+        return;
+    }
+    PFN_xrPerfSettingsSetPerformanceLevelEXT setLevel = nullptr;
+    if (XR_FAILED(xrGetInstanceProcAddr(app.instance,
+                                        "xrPerfSettingsSetPerformanceLevelEXT",
+                                        (PFN_xrVoidFunction*)&setLevel)) ||
+        setLevel == nullptr)
+    {
+        return;
+    }
+    const XrPerfSettingsLevelEXT levels[] = {
+        XR_PERF_SETTINGS_LEVEL_POWER_SAVINGS_EXT,
+        XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT,
+        XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT,
+        XR_PERF_SETTINGS_LEVEL_BOOST_EXT};
+    auto pick = [&](const char* prop) {
+        int index = (int)sysPropFloat(prop, 2.0f);
+        return levels[index < 0 ? 0 : (index > 3 ? 3 : index)];
+    };
+    const XrPerfSettingsLevelEXT gpu = pick("debug.rivevr.gpulevel");
+    const XrPerfSettingsLevelEXT cpu = pick("debug.rivevr.cpulevel");
+    XrResult gr = setLevel(app.session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, gpu);
+    XrResult cr = setLevel(app.session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, cpu);
+    LOGI("Perf levels requested: GPU %d (result %d), CPU %d (result %d)",
+         (int)gpu,
+         (int)gr,
+         (int)cpu,
+         (int)cr);
+}
+
 bool initInput(App& app)
 {
     for (int hand = 0; hand < 2; ++hand)
@@ -354,8 +393,32 @@ bool initOpenXR(App& app)
     loaderInit.applicationContext = app.android->activity->clazz;
     XR_CHECK(initializeLoader((const XrLoaderInitInfoBaseHeaderKHR*)&loaderInit));
 
-    const char* extensions[] = {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
-                                XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME};
+    // Optional: XR_EXT_performance_settings lets us ask for higher CPU/GPU
+    // clock levels (see applyPerformanceLevels).
+    uint32_t extCount = 0;
+    xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+    std::vector<XrExtensionProperties> available(
+        extCount,
+        {XR_TYPE_EXTENSION_PROPERTIES});
+    xrEnumerateInstanceExtensionProperties(nullptr,
+                                           extCount,
+                                           &extCount,
+                                           available.data());
+    for (const XrExtensionProperties& ext : available)
+    {
+        if (strcmp(ext.extensionName,
+                   XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME) == 0)
+        {
+            app.hasPerfSettings = true;
+        }
+    }
+    std::vector<const char*> extensions = {
+        XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
+        XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME};
+    if (app.hasPerfSettings)
+    {
+        extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    }
     XrInstanceCreateInfoAndroidKHR androidInfo{
         XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidInfo.applicationVM = app.android->activity->vm;
@@ -363,8 +426,8 @@ bool initOpenXR(App& app)
 
     XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
     createInfo.next = &androidInfo;
-    createInfo.enabledExtensionCount = 2;
-    createInfo.enabledExtensionNames = extensions;
+    createInfo.enabledExtensionCount = (uint32_t)extensions.size();
+    createInfo.enabledExtensionNames = extensions.data();
     strcpy(createInfo.applicationInfo.applicationName, "Rive VR");
     createInfo.applicationInfo.applicationVersion = 1;
     strcpy(createInfo.applicationInfo.engineName, "rive-vr");
@@ -406,6 +469,7 @@ bool initOpenXR(App& app)
     sessionInfo.next = &binding;
     sessionInfo.systemId = app.systemId;
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
+    applyPerformanceLevels(app);
 
     XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
