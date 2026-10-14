@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """A fake player for testing local multiplayer with one headset.
 
-Broadcasts the same packets the app does (UDP port 47777, the Wi-Fi subnet's
-broadcast address): a head circling in front of the spawn point with its
-hands waving. It also listens and prints a line whenever a headset's packets
-arrive, so you can check both directions.
+Speaks the app's protocol (UDP port 47777): a broadcast hello twice a second
+for discovery, and every frame direct to each headset it has heard. It plays
+a head circling in front of the spawn point with its hands waving, and prints
+each headset it hears so you can check both directions.
 
 With --follow (the default) it hovers 1 m in front of the first headset it
 hears, facing it, so it is always in view.
@@ -22,8 +22,9 @@ import subprocess
 import time
 
 PORT = 47777
-MAGIC = 0x31525652  # "RVR1"
-PACKET = struct.Struct('<III21f')
+MAGIC = 0x32525652  # "RVR2"
+PACKET = struct.Struct('<IIId21f')
+HELLO_INTERVAL = 0.5
 
 
 def broadcast_address(interface):
@@ -55,6 +56,8 @@ def main():
     seq, start, heard, last_report = 0, time.time(), {}, 0.0
     followed = None  # (head position, yaw) of the first headset heard
     followed_id = None
+    peers = {}  # id -> ip, for direct sends
+    last_hello = 0.0
     while time.time() - start < args.seconds:
         t = time.time() - start
         if args.follow and followed:
@@ -74,15 +77,21 @@ def main():
         left = (hx - 0.25 * math.cos(angle), hy - 0.35 + wave, hz + 0.25 * math.sin(angle)) + yaw_quat(angle)
         right = (hx + 0.25 * math.cos(angle), hy - 0.35 - wave, hz - 0.25 * math.sin(angle)) + yaw_quat(angle)
         seq += 1
-        sock.sendto(PACKET.pack(MAGIC, my_id, seq, *head, *left, *right), (target, PORT))
+        packet = PACKET.pack(MAGIC, my_id, seq, time.monotonic(), *head, *left, *right)
+        for ip in peers.values():
+            sock.sendto(packet, (ip, PORT))
+        if time.time() - last_hello > HELLO_INTERVAL:
+            last_hello = time.time()
+            sock.sendto(packet, (target, PORT))
 
         try:
             while True:
                 data, (ip, _) = sock.recvfrom(256)
                 if len(data) == PACKET.size:
-                    magic, pid, _, *pose = PACKET.unpack(data)
+                    magic, pid, _, _, *pose = PACKET.unpack(data)
                     if magic == MAGIC and pid != my_id:
                         heard[pid] = (ip, pose[:3])
+                        peers[pid] = ip
                         if followed is None or followed_id == pid:
                             followed_id = pid
                             qx, qy, qz, qw = pose[3:7]

@@ -905,7 +905,7 @@ void sendLocalPose(App& app)
     {
         pose.v[i] = app.netOut[i] != nullptr ? app.netOut[i]->value() : 0.0f;
     }
-    app.lan.send(pose);
+    app.lan.send(pose, monotonicSeconds());
 }
 
 // Android filters incoming broadcast/multicast on Wi-Fi unless an app holds a

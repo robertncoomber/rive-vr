@@ -20,8 +20,10 @@
 
 namespace
 {
-constexpr uint32_t kMagic = 0x31525652; // "RVR1"
+constexpr uint32_t kMagic = 0x32525652; // "RVR2"
 constexpr size_t kMaxSnapshots = 32;
+constexpr size_t kOffsetWindow = 64;
+constexpr double kStatsInterval = 3.0;
 
 #pragma pack(push, 1)
 struct Packet
@@ -29,6 +31,7 @@ struct Packet
     uint32_t magic;
     uint32_t id;
     uint32_t seq;
+    double sendTime; // sender's monotonic clock, seconds
     float pose[21];
 };
 #pragma pack(pop)
@@ -133,7 +136,7 @@ void LanSession::stop()
     }
 }
 
-void LanSession::send(const NetPose& pose)
+void LanSession::send(const NetPose& pose, double now)
 {
     if (m_socket < 0)
     {
@@ -143,12 +146,29 @@ void LanSession::send(const NetPose& pose)
     packet.magic = kMagic;
     packet.id = m_id;
     packet.seq = ++m_seq;
+    packet.sendTime = now;
     memcpy(packet.pose, pose.v, sizeof(packet.pose));
-    sockaddr_in to{};
-    to.sin_family = AF_INET;
-    to.sin_port = htons(kPort);
-    to.sin_addr.s_addr = m_broadcastAddr;
-    sendto(m_socket, &packet, sizeof(packet), 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
+
+    // Every frame, direct to each known peer.
+    for (auto& [id, peer] : m_peers)
+    {
+        sendto(m_socket,
+               &packet,
+               sizeof(packet),
+               0,
+               reinterpret_cast<const sockaddr*>(&peer.addr),
+               sizeof(peer.addr));
+    }
+    // A few times a second, broadcast so new peers can find us.
+    if (now - m_lastHello >= kHelloInterval)
+    {
+        m_lastHello = now;
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(kPort);
+        to.sin_addr.s_addr = m_broadcastAddr;
+        sendto(m_socket, &packet, sizeof(packet), 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
+    }
 }
 
 void LanSession::poll(double now)
@@ -158,9 +178,16 @@ void LanSession::poll(double now)
         return;
     }
     Packet packet;
+    sockaddr_in from{};
     for (;;)
     {
-        ssize_t n = recv(m_socket, &packet, sizeof(packet), 0);
+        socklen_t fromLen = sizeof(from);
+        ssize_t n = recvfrom(m_socket,
+                             &packet,
+                             sizeof(packet),
+                             0,
+                             reinterpret_cast<sockaddr*>(&from),
+                             &fromLen);
         if (n < 0)
         {
             break; // EAGAIN: drained
@@ -173,20 +200,50 @@ void LanSession::poll(double now)
         Peer& peer = it->second;
         if (isNew)
         {
-            LOGI("Player %08x joined", packet.id);
+            char text[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &from.sin_addr, text, sizeof(text));
+            LOGI("Player %08x joined from %s", packet.id, text);
+            peer.statsStart = now;
         }
-        else if (packet.seq <= peer.lastSeq && peer.lastSeq - packet.seq < 1000)
+        peer.addr = from;
+        peer.addr.sin_port = htons(kPort);
+        if (!isNew && packet.seq <= peer.lastSeq && peer.lastSeq - packet.seq < 1000)
         {
-            continue; // late or duplicate
+            continue; // duplicate (broadcast + unicast) or late
         }
         peer.lastSeq = packet.seq;
         peer.lastHeard = now;
-        Snapshot snap{now, {}};
+
+        // Clock offset: the smallest recent arrival - send gap.
+        peer.offsets.push_back(now - packet.sendTime);
+        if (peer.offsets.size() > kOffsetWindow)
+        {
+            peer.offsets.erase(peer.offsets.begin());
+        }
+
+        Snapshot snap{packet.sendTime, {}};
         memcpy(snap.pose.v, packet.pose, sizeof(packet.pose));
         peer.snapshots.push_back(snap);
         if (peer.snapshots.size() > kMaxSnapshots)
         {
             peer.snapshots.erase(peer.snapshots.begin());
+        }
+
+        if (peer.lastArrival > 0)
+        {
+            peer.maxGap = std::max(peer.maxGap, now - peer.lastArrival);
+        }
+        peer.lastArrival = now;
+        peer.received++;
+        if (now - peer.statsStart >= kStatsInterval)
+        {
+            LOGI("Player %08x: %.0f packets/s, longest gap %.0f ms",
+                 it->first,
+                 peer.received / (now - peer.statsStart),
+                 peer.maxGap * 1000);
+            peer.received = 0;
+            peer.maxGap = 0;
+            peer.statsStart = now;
         }
     }
 }
@@ -194,7 +251,6 @@ void LanSession::poll(double now)
 std::vector<RemotePlayer> LanSession::sample(double now)
 {
     std::vector<RemotePlayer> result;
-    const double renderTime = now - kInterpDelay;
     for (auto it = m_peers.begin(); it != m_peers.end();)
     {
         Peer& peer = it->second;
@@ -204,28 +260,31 @@ std::vector<RemotePlayer> LanSession::sample(double now)
             it = m_peers.erase(it);
             continue;
         }
+        // Render time on the sender's clock.
+        const double offset = *std::min_element(peer.offsets.begin(), peer.offsets.end());
+        const double renderTime = now - offset - kInterpDelay;
         RemotePlayer player;
         player.id = it->first;
         const auto& snaps = peer.snapshots;
-        if (renderTime <= snaps.front().time)
+        if (renderTime <= snaps.front().sendTime)
         {
             player.pose = snaps.front().pose;
         }
-        else if (renderTime >= snaps.back().time)
+        else if (renderTime >= snaps.back().sendTime)
         {
             player.pose = snaps.back().pose; // starved: hold the newest
         }
         else
         {
             size_t i = 1;
-            while (snaps[i].time < renderTime)
+            while (snaps[i].sendTime < renderTime)
             {
                 ++i;
             }
             const Snapshot& a = snaps[i - 1];
             const Snapshot& b = snaps[i];
-            const double span = b.time - a.time;
-            const float t = span > 0 ? (float)((renderTime - a.time) / span) : 1.0f;
+            const double span = b.sendTime - a.sendTime;
+            const float t = span > 0 ? (float)((renderTime - a.sendTime) / span) : 1.0f;
             lerpPose(a.pose, b.pose, t, player.pose);
         }
         result.push_back(player);
