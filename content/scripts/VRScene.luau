@@ -108,7 +108,7 @@ local HELMET_UBO_SIZE = 160 -- mat4 viewProj, mat4 model, vec4 camPos, vec4 ligh
 
 type HelmetMesh = { vertices: GPUBuffer, indices: GPUBuffer, vertexCount: number, indexCount: number }
 
-type Hand = { pinned: boolean, x: number, y: number, z: number }
+type Hand = { touching: boolean, ready: boolean, x: number, y: number, z: number }
 
 type VRScene = {
   menu: Input<Artboard<Data.Menu>>,
@@ -157,9 +157,8 @@ type VRScene = {
   -- Locomotion: the rig is where the play space sits in the world.
   rigX: number, rigY: number, rigZ: number,
   velX: number, velY: number, velZ: number,
-  airborne: boolean,
   hands: { Hand },
-  history: { { number } }, -- recent rig moves while a hand is stuck: dx, dy, dz, dt
+  history: { { number } }, -- recent body velocities: vx, vy, vz
   hover: { number },     -- per button 0..1, eased
   flash: { number },     -- per button 0..1, decays after a press
   rayLength: { number }, -- per hand
@@ -402,14 +401,17 @@ local function buttonAt(x: number, y: number): number
 end
 
 -- ---------------------------------------------------------------- locomotion
--- Gorilla Tag style, no sticks. A hand that touches a surface sticks there,
--- and moving that hand moves the body the opposite way: push down to rise,
--- pull back to go forward, climb hand over hand. Letting go while moving
--- launches the body with its recent velocity. Feet and head spheres keep
--- the body out of the geometry; gravity applies while no hand is stuck.
+-- Gorilla Tag style, no sticks (after the open source GorillaLocomotion).
+-- Each frame each hand is swept from where it was to where it is now. If a
+-- surface blocks it, the hand stays put and the body moves instead, so
+-- pushing a hand down lifts you and pulling it back moves you forward. A hand
+-- that moves away from the surface is simply free again. The body keeps a
+-- short velocity history; while any hand is touching and that velocity is
+-- above a small limit it becomes momentum, so a hard push flings you as the
+-- hand comes off. Gravity applies whenever no hand is touching.
 
 local HAND_RADIUS = 0.06
-local HAND_RELEASE = 0.03 -- how far a stuck hand may lift off before letting go
+local MAX_ARM_LENGTH = 1.0 -- a stuck hand lets go beyond this from the real hand
 local FEET_RADIUS = 0.2
 -- The body hangs this far below the head (1.5 ft), gorilla style: the feet
 -- rest here, not at your real floor, so the ground stays within arm's reach.
@@ -418,8 +420,10 @@ local HEAD_RADIUS = 0.15
 local GRAVITY = 9.8
 local JUMP_MULTIPLIER = 1.1
 local MAX_JUMP_SPEED = 6.5
-local HISTORY = 5
-local GROUND_FRICTION = 10
+local VELOCITY_LIMIT = 0.4 -- below this a touching body just holds still
+local HISTORY = 8 -- frames of body velocity averaged for jumps
+local GROUND_FRICTION = 4
+local SWEEP_STEPS = 4
 
 type Box = { x0: number, x1: number, y0: number, y1: number, z0: number, z1: number }
 local COLLIDERS: { Box } = {
@@ -433,18 +437,6 @@ for _, o in OBJECTS do
       z0 = o.z - o.sz / 2, z1 = o.z + o.sz / 2,
     })
   end
-end
-
--- Distance from a point to the nearest collider (0 inside one).
-local function nearestDistance(x: number, y: number, z: number): number
-  local best = math.huge
-  for _, b in COLLIDERS do
-    local dx = math.max(b.x0 - x, 0, x - b.x1)
-    local dy = math.max(b.y0 - y, 0, y - b.y1)
-    local dz = math.max(b.z0 - z, 0, z - b.z1)
-    best = math.min(best, math.sqrt(dx * dx + dy * dy + dz * dz))
-  end
-  return best
 end
 
 -- Pushes a sphere out of the colliders it overlaps. Returns the push.
@@ -487,74 +479,89 @@ local function pushOut(x: number, y: number, z: number, r: number): (number, num
   return px, py, pz
 end
 
+-- Sweeps a hand sphere from a to b. Returns the contact centre if a surface
+-- blocks it on the way.
+local function sweepHand(ax: number, ay: number, az: number,
+                         bx: number, by: number, bz: number): (boolean, number, number, number)
+  for i = 1, SWEEP_STEPS do
+    local t = i / SWEEP_STEPS
+    local x, y, z = ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t
+    local px, py, pz = pushOut(x, y, z, HAND_RADIUS)
+    if px ~= 0 or py ~= 0 or pz ~= 0 then
+      return true, x + px, y + py, z + pz
+    end
+  end
+  return false, bx, by, bz
+end
+
 local function locomote(self: VRScene, seconds: number)
   local dt = math.clamp(seconds, 1 / 240, 1 / 30)
+  local startX, startY, startZ = self.rigX, self.rigY, self.rigZ
 
-  -- Hands: stick on contact, unstick when lifted off.
-  local mx, my, mz, stuck = 0, 0, 0, 0
+  -- Momentum and gravity move the body first; touching hands correct it.
+  local wasTouching = self.hands[1].touching or self.hands[2].touching
+  if not wasTouching then
+    self.velY -= GRAVITY * dt
+  end
+  self.rigX += self.velX * dt
+  self.rigY += self.velY * dt
+  self.rigZ += self.velZ * dt
+
+  -- Hands: sweep from last frame's position to where the real hand is now.
+  local bias = 2 * GRAVITY * dt * dt -- keeps a resting hand in contact
+  local mx, my, mz, touching = 0, 0, 0, 0
+  local targets: { { number } } = {}
   for h, hand in { 'L', 'R' } do
     local st = self.hands[h]
-    if num(self, 'active' .. hand) > 0.5 then
-      local g = 'grip' .. hand .. '_'
-      local tx = self.rigX + num(self, g .. 'px')
-      local ty = self.rigY + num(self, g .. 'py')
-      local tz = self.rigZ + num(self, g .. 'pz')
-      if st.pinned and nearestDistance(tx, ty, tz) > HAND_RADIUS + HAND_RELEASE then
-        st.pinned = false
-      end
-      if not st.pinned then
-        local px, py, pz = pushOut(tx, ty, tz, HAND_RADIUS)
-        if px ~= 0 or py ~= 0 or pz ~= 0 then
-          st.pinned = true
-          st.x, st.y, st.z = tx + px, ty + py, tz + pz
-        end
-      end
-      if st.pinned then
-        mx += st.x - tx
-        my += st.y - ty
-        mz += st.z - tz
-        stuck += 1
+    local g = 'grip' .. hand .. '_'
+    local tx = self.rigX + num(self, g .. 'px')
+    local ty = self.rigY + num(self, g .. 'py')
+    local tz = self.rigZ + num(self, g .. 'pz')
+    targets[h] = { tx, ty, tz }
+    if num(self, 'active' .. hand) < 0.5 then
+      st.touching = false
+      st.ready = false
+      continue
+    end
+    if not st.ready then
+      st.x, st.y, st.z = tx, ty, tz
+      st.ready = true
+    end
+    local hit, cx, cy, cz = sweepHand(st.x, st.y, st.z, tx, ty - bias, tz)
+    if hit then
+      -- Keep touching where it first touched; a new touch sticks at contact.
+      local hx, hy, hz = if st.touching then st.x else cx, if st.touching then st.y else cy,
+        if st.touching then st.z else cz
+      local ox, oy, oz = hx - tx, hy - ty, hz - tz
+      if ox * ox + oy * oy + oz * oz > MAX_ARM_LENGTH * MAX_ARM_LENGTH then
+        st.touching = false
+      else
+        st.touching = true
+        st.x, st.y, st.z = hx, hy, hz
+        mx += ox
+        my += oy
+        mz += oz
+        touching += 1
       end
     else
-      st.pinned = false
+      st.touching = false
     end
   end
 
-  if stuck > 0 then
-    -- The body moves so the stuck hands stay put.
-    local dx, dy, dz = mx / stuck, my / stuck, mz / stuck
-    self.rigX += dx
-    self.rigY += dy
-    self.rigZ += dz
-    table.insert(self.history, { dx, dy, dz, dt })
-    if #self.history > HISTORY then
-      table.remove(self.history, 1)
+  if touching > 0 then
+    self.rigX += mx / touching
+    self.rigY += my / touching
+    self.rigZ += mz / touching
+  end
+  -- Free hands travel with the body.
+  for h = 1, 2 do
+    local st = self.hands[h]
+    if st.ready and not st.touching then
+      local t = targets[h]
+      st.x = t[1] + (if touching > 0 then mx / touching else 0)
+      st.y = t[2] + (if touching > 0 then my / touching else 0)
+      st.z = t[3] + (if touching > 0 then mz / touching else 0)
     end
-    self.velX, self.velY, self.velZ = 0, 0, 0
-    self.airborne = false
-  else
-    if not self.airborne then
-      -- Just let go: launch with the recent hand-driven velocity.
-      local sx, sy, sz, st = 0, 0, 0, 0
-      for _, m in self.history do
-        sx += m[1]
-        sy += m[2]
-        sz += m[3]
-        st += m[4]
-      end
-      if st > 0 then
-        local vx, vy, vz = sx / st * JUMP_MULTIPLIER, sy / st * JUMP_MULTIPLIER, sz / st * JUMP_MULTIPLIER
-        local speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-        local k = if speed > MAX_JUMP_SPEED then MAX_JUMP_SPEED / speed else 1
-        self.velX, self.velY, self.velZ = vx * k, vy * k, vz * k
-      end
-      self.history = {}
-      self.airborne = true
-    end
-    self.velY -= GRAVITY * dt
-    self.rigX += self.velX * dt
-    self.rigY += self.velY * dt
-    self.rigZ += self.velZ * dt
   end
 
   -- Body: a short body under the head, and the head itself, push out of
@@ -566,25 +573,52 @@ local function locomote(self: VRScene, seconds: number)
   self.rigX += px
   self.rigY += py
   self.rigZ += pz
-  if py > 0 and stuck == 0 then
-    -- Standing: stop falling and let friction stop sliding.
+  local onFeet = py > 0
+  px, py, pz = pushOut(hx + px, hy + py, hz + pz, HEAD_RADIUS)
+  self.rigX += px
+  self.rigY += py
+  self.rigZ += pz
+
+  -- Velocity: what the body actually did, averaged over recent frames.
+  table.insert(self.history, {
+    (self.rigX - startX) / dt, (self.rigY - startY) / dt, (self.rigZ - startZ) / dt,
+  })
+  if #self.history > HISTORY then
+    table.remove(self.history, 1)
+  end
+  if touching > 0 then
+    local ax, ay, az = 0, 0, 0
+    for _, v in self.history do
+      ax += v[1]
+      ay += v[2]
+      az += v[3]
+    end
+    local n = #self.history
+    ax, ay, az = ax / n, ay / n, az / n
+    local speed = math.sqrt(ax * ax + ay * ay + az * az)
+    if speed > VELOCITY_LIMIT then
+      -- Moving hard while touching: that becomes momentum, so the push flings.
+      local k = math.min(JUMP_MULTIPLIER, MAX_JUMP_SPEED / speed)
+      self.velX, self.velY, self.velZ = ax * k, ay * k, az * k
+    else
+      self.velX, self.velY, self.velZ = 0, 0, 0
+    end
+  elseif onFeet then
+    -- Landed on the body: stop falling, keep some slide.
     self.velY = math.max(self.velY, 0)
     local f = math.max(0, 1 - GROUND_FRICTION * dt)
     self.velX *= f
     self.velZ *= f
   end
-  px, py, pz = pushOut(hx + px, hy + py, hz + pz, HEAD_RADIUS)
-  self.rigX += px
-  self.rigY += py
-  self.rigZ += pz
   if py < 0 and self.velY > 0 then
-    self.velY = 0
+    self.velY = 0 -- bumped the head
   end
 
   -- Fell out of the world: back to the start.
   if self.rigY < -30 then
     self.rigX, self.rigY, self.rigZ = 0, 0, 0
     self.velX, self.velY, self.velZ = 0, 0, 0
+    self.history = {}
   end
 end
 
@@ -919,9 +953,9 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
       table.insert(activeHands, h)
       local t = math.clamp(num(self, 'trigger' .. hand), 0, 1)
       local gx, gy, gz, gr = poseOf(self, 'grip' .. hand .. '_')
-      local stuckHand = self.hands[h]
-      if stuckHand.pinned then
-        gx, gy, gz = stuckHand.x, stuckHand.y, stuckHand.z
+      local handState = self.hands[h]
+      if handState.touching then
+        gx, gy, gz = handState.x, handState.y, handState.z
       end
       local ax, ay, az, ar = poseOf(self, 'aim' .. hand .. '_')
       local len = self.rayLength[h]
@@ -1182,8 +1216,10 @@ return function(): Node<VRScene>
     menuX = 0, menuY = 0, menuZ = 0, menuYaw = 0,
     rigX = 0, rigY = 0, rigZ = 0,
     velX = 0, velY = 0, velZ = 0,
-    airborne = false,
-    hands = { { pinned = false, x = 0, y = 0, z = 0 }, { pinned = false, x = 0, y = 0, z = 0 } },
+    hands = {
+      { touching = false, ready = false, x = 0, y = 0, z = 0 },
+      { touching = false, ready = false, x = 0, y = 0, z = 0 },
+    },
     history = {},
     hover = { 0, 0, 0 },
     flash = { 0, 0, 0 },
