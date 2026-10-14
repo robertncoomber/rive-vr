@@ -1,5 +1,7 @@
--- VRScene: the whole MVP scene, rendered once per eye from the XR ViewModel
--- (eye poses, controller poses, triggers written by the native host).
+-- VRScene: a Gorilla Tag style playground rendered entirely by Rive. The
+-- native host writes eye poses, controller poses and triggers into the XR
+-- ViewModel; this script moves the body (see locomotion), then renders the
+-- level, controllers and rays once per eye.
 --
 -- Two output paths, chosen by the host through the XR ViewModel:
 --  - canvas (direct = 0): each eye renders into its own gpuCanvas, then both
@@ -9,46 +11,16 @@
 --    GL can only wrap the target top-down, so the projection is flipped in Y
 --    (and culling flipped with it) to land upright in OpenXR's bottom-up image.
 -- msaa (1, 2 or 4) sets the sample count for both paths.
---
--- Contents: grid floor, three lit cubes (one spinning), a box per controller
--- with an aim ray, and the Menu artboard drawn into a canvas and shown on a
--- quad in the world. Rays hit-test the quad; pulling a trigger over a button
--- fires it (Colour / Spin / Grid).
 
 local DEFAULT_SAMPLES = 4
 local DEPTH_FORMAT: DepthFormat = 'depth24plus-stencil8'
 local NEAR = 0.05
 local FAR = 100
 local UBO_SIZE = 160 -- mat4 viewProj, mat4 model, vec4 color, vec4 params
-local MENU_UBO_SIZE = 128 -- mat4 viewProj, mat4 model
-
--- Menu panel: artboard pixels, size in the world, placement from the head.
-local MENU_W = 1024
-local MENU_H = 512
-local MENU_SIZE_X = 0.6
-local MENU_SIZE_Y = 0.3
-local MENU_DISTANCE = 0.9
-local MENU_DROP = 0.3
--- Button rectangles in Menu artboard pixels (fixed by its layout).
-local BUTTON_X: { { number } } = { { 40, 336 }, { 364, 660 }, { 688, 984 } }
-local BUTTON_Y0 = 190
-local BUTTON_Y1 = 472
-local PRESS_THRESHOLD = 0.6
 
 local BOX_SIZE: { number } = { 0.05, 0.04, 0.12 }
 local RAY_WIDTH = 0.003
 local RAY_LENGTH = 1.5
-
-type Swatch = { name: string, r: number, g: number, b: number }
-local CUBE_COLOURS: { Swatch } = {
-  { name = 'Orange', r = 0.95, g = 0.45, b = 0.2 },
-  { name = 'Magenta', r = 0.9, g = 0.25, b = 0.75 },
-  { name = 'Teal', r = 0.15, g = 0.8, b = 0.7 },
-  { name = 'Gold', r = 0.95, g = 0.8, b = 0.2 },
-}
-local BTN_IDLE = Color.rgb(0x26, 0x2F, 0x3E)
-local BTN_HOVER = Color.rgb(0x34, 0x4C, 0x7A)
-local BTN_PRESS = Color.rgb(0x4C, 0x7D, 0xF0)
 
 type Eye = {
   canvas: GPUCanvas?,          -- canvas path only
@@ -56,32 +28,26 @@ type Eye = {
   depthView: GPUTextureView?,  -- canvas path only
   ubos: { GPUBuffer },
   groups: { GPUBindGroup },
-  menuUbo: GPUBuffer,
-  menuGroup: GPUBindGroup?,
-  helmetUbo: GPUBuffer,
-  helmetGroup: GPUBindGroup?,
 }
 
 type Obj = {
   mesh: string, -- 'cube' | 'floor'
   x: number, y: number, z: number, -- centre
   sx: number, sy: number, sz: number, -- size (floor: half extents)
-  spins: boolean,
   r: number, g: number, b: number,
 }
 
 -- A playground to climb and jump around on: steps, towers, pillars, a back
 -- wall and a floating bridge. Boxes are axis aligned, so they double as
--- colliders. box(x, z, w, h, d) stands on the floor; y overrides its base.
+-- colliders. box(x, z, w, h, d) stands on the floor; base lifts it.
 local function box(x: number, z: number, w: number, h: number, d: number,
                    r: number, g: number, b: number, base: number?): Obj
   local y0 = base or 0
-  return { mesh = 'cube', x = x, y = y0 + h / 2, z = z, sx = w, sy = h, sz = d,
-           spins = false, r = r, g = g, b = b }
+  return { mesh = 'cube', x = x, y = y0 + h / 2, z = z, sx = w, sy = h, sz = d, r = r, g = g, b = b }
 end
 
 local OBJECTS: { Obj } = {
-  { mesh = 'floor', x = 0, y = 0, z = 0, sx = 15, sy = 1, sz = 15, spins = false, r = 0.09, g = 0.1, b = 0.13 },
+  { mesh = 'floor', x = 0, y = 0, z = 0, sx = 15, sy = 1, sz = 15, r = 0.09, g = 0.1, b = 0.13 },
   box(1.7, -1.8, 1.2, 0.6, 1.2, 0.95, 0.55, 0.25),
   box(3.2, -3.0, 1.2, 1.2, 1.2, 0.9, 0.4, 0.35),
   box(4.6, -4.6, 1.2, 1.9, 1.2, 0.8, 0.3, 0.45),
@@ -97,40 +63,12 @@ local OBJECTS: { Obj } = {
 }
 local CONTROLLER_DRAWS = 4 -- box L, ray L, box R, ray R
 
--- The DamagedHelmet (see model/HelmetMesh), floating centre stage. Spin
--- rotates it; Colour tints the key light.
-local HELMET_TEXTURES: { string } = {
-  'helmet_baseColor', 'helmet_metalRough', 'helmet_normal', 'helmet_emissive', 'helmet_occlusion',
-}
-local HELMET_DISTANCE = 1.3
-local HELMET_SCALE = 0.24
-local HELMET_UBO_SIZE = 160 -- mat4 viewProj, mat4 model, vec4 camPos, vec4 light
-
-type HelmetMesh = { vertices: GPUBuffer, indices: GPUBuffer, vertexCount: number, indexCount: number }
-
 type Hand = { touching: boolean, ready: boolean, x: number, y: number, z: number }
 
 type VRScene = {
-  menu: Input<Artboard<Data.Menu>>,
-  menuInstance: Artboard<Data.Menu>?,
-  menuVm: Data.Menu?,
-  menuCanvas: Canvas?,
-  menuPipeline: GPUPipeline?,
-  menuSampler: GPUSampler?,
-  quadVerts: GPUBuffer?,
-  helmet: HelmetMesh?,
-  helmetPipeline: GPUPipeline?,
-  helmetImages: { Image },
-  helmetCanvases: { Canvas },
-  helmetSampler: GPUSampler?,
-  helmetBaked: boolean,
-  helmetX: number, helmetY: number, helmetZ: number,
-  helmetStaging: buffer,
   props: { [string]: Property<number> },
   eyes: { Eye },
   litShader: Shader?,
-  menuShader: Shader?,
-  helmetShader: Shader?,
   config: string,               -- current w/h/samples/path, rebuild on change
   samples: number,
   direct: boolean,
@@ -145,24 +83,11 @@ type VRScene = {
   width: number,
   height: number,
   staging: buffer,
-  menuStaging: buffer,
-  -- Scene state the menu changes
-  spinOn: boolean,
-  gridOn: boolean,
-  colourIndex: number,
-  spinAngle: number,
-  -- Menu placement (set once from the head pose) and interaction
-  menuPlaced: boolean,
-  menuX: number, menuY: number, menuZ: number, menuYaw: number,
   -- Locomotion: the rig is where the play space sits in the world.
   rigX: number, rigY: number, rigZ: number,
   velX: number, velY: number, velZ: number,
   hands: { Hand },
   history: { { number } }, -- recent body velocities: vx, vy, vz
-  hover: { number },     -- per button 0..1, eased
-  flash: { number },     -- per button 0..1, decays after a press
-  rayLength: { number }, -- per hand
-  lastTrigger: { number },
 }
 
 local PROP_NAMES: { string } = { 'eyeWidth', 'eyeHeight', 'frameIndex', 'seenFrame', 'msaa', 'direct' }
@@ -211,14 +136,6 @@ local function floorData(): { number }
   local t: { number } = {}
   push(t, -1, 0, -1, 0, 1, 0,  -1, 0, 1, 0, 1, 0,  1, 0, 1, 0, 1, 0)
   push(t, -1, 0, -1, 0, 1, 0,  1, 0, 1, 0, 1, 0,  1, 0, -1, 0, 1, 0)
-  return t
-end
-
--- Unit quad in XY facing +Z: position xyz + uv (v = 0 at the top).
-local function quadData(): { number }
-  local t: { number } = {}
-  push(t, -0.5, -0.5, 0, 0, 1,  0.5, -0.5, 0, 1, 1,  0.5, 0.5, 0, 1, 0)
-  push(t, -0.5, -0.5, 0, 0, 1,  0.5, 0.5, 0, 1, 0,  -0.5, 0.5, 0, 0, 0)
   return t
 end
 
@@ -295,13 +212,11 @@ local function poseModel(px: number, py: number, pz: number, r: { { number } },
   }
 end
 
-local function yawModel(x: number, y: number, z: number, yaw: number,
-                        sx: number, sy: number, sz: number): { number }
-  local c, s = math.cos(yaw), math.sin(yaw)
+local function boxModel(x: number, y: number, z: number, sx: number, sy: number, sz: number): { number }
   return {
-    c * sx, 0, -s * sx, 0,
+    sx, 0, 0, 0,
     0, sy, 0, 0,
-    s * sz, 0, c * sz, 0,
+    0, 0, sz, 0,
     x, y, z, 1,
   }
 end
@@ -319,85 +234,6 @@ local function poseOf(self: VRScene, prefix: string): (number, number, number, {
     self.rigZ + num(self, prefix .. 'pz'),
     quatRows(num(self, prefix .. 'qx'), num(self, prefix .. 'qy'),
              num(self, prefix .. 'qz'), num(self, prefix .. 'qw'))
-end
-
-local function refreshMenuText(self: VRScene)
-  local vm = self.menuVm
-  if vm then
-    vm.stateColour.value = CUBE_COLOURS[self.colourIndex].name
-    vm.stateSpin.value = if self.spinOn then 'On' else 'Off'
-    vm.stateGrid.value = if self.gridOn then 'On' else 'Off'
-  end
-end
-
-local function pressButton(self: VRScene, button: number)
-  self.flash[button] = 1
-  if button == 1 then
-    self.colourIndex = self.colourIndex % #CUBE_COLOURS + 1
-  elseif button == 2 then
-    self.spinOn = not self.spinOn
-  else
-    self.gridOn = not self.gridOn
-  end
-  refreshMenuText(self)
-end
-
--- Places the menu once, in front of where the head is looking.
-local function placeMenu(self: VRScene)
-  local px, py, pz, r = poseOf(self, 'eyeL_')
-  if num(self, 'eyeL_qw') == 0 and num(self, 'eyeL_qy') == 0 then
-    return
-  end
-  local fx, fz = -r[1][3], -r[3][3]
-  local len = math.sqrt(fx * fx + fz * fz)
-  if len < 0.001 then
-    return
-  end
-  fx, fz = fx / len, fz / len
-  self.menuX = px + fx * MENU_DISTANCE
-  self.menuY = py - MENU_DROP
-  self.menuZ = pz + fz * MENU_DISTANCE
-  self.menuYaw = math.atan2(-fx, -fz)
-  -- The helmet floats further out at eye height, above the menu.
-  self.helmetX = px + fx * HELMET_DISTANCE
-  self.helmetY = py - 0.05
-  self.helmetZ = pz + fz * HELMET_DISTANCE
-  self.menuPlaced = true
-end
-
--- Ray vs menu plane. Returns distance and menu pixel coords on a hit.
-local function hitMenu(self: VRScene, hand: string): (number?, number, number)
-  local ox, oy, oz, r = poseOf(self, 'aim' .. hand .. '_')
-  local dx, dy, dz = -r[1][3], -r[2][3], -r[3][3]
-  local c, s = math.cos(self.menuYaw), math.sin(self.menuYaw)
-  local nx, nz = s, c -- menu normal (its +Z)
-  local denom = dx * nx + dz * nz
-  if denom > -0.0001 then
-    return nil, 0, 0
-  end
-  local t = ((self.menuX - ox) * nx + (self.menuZ - oz) * nz) / denom
-  if t <= 0 or t > RAY_LENGTH then
-    return nil, 0, 0
-  end
-  local hx, hy, hz = ox + dx * t - self.menuX, oy + dy * t - self.menuY, oz + dz * t - self.menuZ
-  local u = (hx * c - hz * s) / MENU_SIZE_X + 0.5
-  local v = 0.5 - hy / MENU_SIZE_Y
-  if u < 0 or u > 1 or v < 0 or v > 1 then
-    return nil, 0, 0
-  end
-  return t, u * MENU_W, v * MENU_H
-end
-
-local function buttonAt(x: number, y: number): number
-  if y < BUTTON_Y0 or y > BUTTON_Y1 then
-    return 0
-  end
-  for i, span in BUTTON_X do
-    if x >= span[1] and x <= span[2] then
-      return i
-    end
-  end
-  return 0
 end
 
 -- ---------------------------------------------------------------- locomotion
@@ -651,24 +487,7 @@ local function makeEye(self: VRScene, w: number, h: number, withCanvas: boolean)
     depthView = if withCanvas then depthTexture(w, h, self.samples, 'eye-depth') else nil,
     ubos = {},
     groups = {},
-    menuUbo = GPUBuffer.new({ size = MENU_UBO_SIZE, usage = 'uniform' }),
-    menuGroup = nil,
-    helmetUbo = GPUBuffer.new({ size = HELMET_UBO_SIZE, usage = 'uniform' }),
-    helmetGroup = nil,
   }
-  local helmetPipeline = self.helmetPipeline
-  if helmetPipeline and self.helmetSampler and #self.helmetCanvases == #HELMET_TEXTURES then
-    local textures: { TextureEntry } = {}
-    for i, c in self.helmetCanvases do
-      table.insert(textures, { slot = i, view = c.image:view() })
-    end
-    eye.helmetGroup = GPUBindGroup.new({
-      layout = helmetPipeline:getBindGroupLayout(0),
-      ubos = { { slot = 0, buffer = eye.helmetUbo } },
-      textures = textures,
-      samplers = { { slot = 6, sampler = self.helmetSampler :: GPUSampler } },
-    })
-  end
   local pipeline = self.pipeline :: GPUPipeline
   for _ = 1, #OBJECTS + CONTROLLER_DRAWS do
     local ubo = GPUBuffer.new({ size = UBO_SIZE, usage = 'uniform' })
@@ -678,24 +497,13 @@ local function makeEye(self: VRScene, w: number, h: number, withCanvas: boolean)
       ubos = { { slot = 0, buffer = ubo } },
     }))
   end
-  local menuCanvas = self.menuCanvas
-  local menuPipeline = self.menuPipeline
-  if menuCanvas and menuPipeline and self.menuSampler then
-    eye.menuGroup = GPUBindGroup.new({
-      layout = menuPipeline:getBindGroupLayout(0),
-      ubos = { { slot = 0, buffer = eye.menuUbo } },
-      textures = { { slot = 1, view = menuCanvas.image:view() } },
-      samplers = { { slot = 2, sampler = self.menuSampler :: GPUSampler } },
-    })
-  end
   return eye
 end
 
--- Pipelines depend on the sample count and, for the direct path, flipped
+-- The pipeline depends on the sample count and, for the direct path, flipped
 -- culling; rebuilt whenever either changes.
 local function buildPipelines(self: VRScene, samples: number, cull: CullMode)
   local lit = self.litShader :: Shader
-  local menu = self.menuShader :: Shader
   self.pipeline = GPUPipeline.new({
     vertex = { module = lit, entryPoint = 'vs' },
     fragment = { module = lit, entryPoint = 'fs' },
@@ -711,49 +519,9 @@ local function buildPipelines(self: VRScene, samples: number, cull: CullMode)
     cullMode = cull,
     sampleCount = samples,
   })
-  self.menuPipeline = GPUPipeline.new({
-    vertex = { module = menu, entryPoint = 'vs' },
-    fragment = { module = menu, entryPoint = 'fs' },
-    vertexLayout = { {
-      stride = 20,
-      attributes = {
-        { format = 'float32x3', slot = 0, offset = 0 },
-        { format = 'float32x2', slot = 1, offset = 12 },
-      },
-    } },
-    colorTargets = { {
-      format = 'rgba8unorm',
-      blend = {
-        srcColor = 'one', dstColor = 'one-minus-src-alpha', colorOp = 'add',
-        srcAlpha = 'one', dstAlpha = 'one-minus-src-alpha', alphaOp = 'add',
-      },
-    } },
-    depthStencil = { format = DEPTH_FORMAT, compare = 'less', write = true },
-    cullMode = 'none',
-    sampleCount = samples,
-  })
-  local helmetShader = self.helmetShader
-  if helmetShader then
-    self.helmetPipeline = GPUPipeline.new({
-      vertex = { module = helmetShader, entryPoint = 'vs' },
-      fragment = { module = helmetShader, entryPoint = 'fs' },
-      vertexLayout = { {
-        stride = 32,
-        attributes = {
-          { format = 'float32x3', slot = 0, offset = 0 },
-          { format = 'float32x3', slot = 1, offset = 12 },
-          { format = 'float32x2', slot = 2, offset = 24 },
-        },
-      } },
-      colorTargets = { { format = 'rgba8unorm' } },
-      depthStencil = { format = DEPTH_FORMAT, compare = 'less', write = true },
-      cullMode = cull,
-      sampleCount = samples,
-    })
-  end
 end
 
--- Rebuilds pipelines, eyes and the direct-path attachments for a new
+-- Rebuilds the pipeline, eyes and the direct-path attachments for a new
 -- resolution, sample count or output path.
 local function configure(self: VRScene, w: number, h: number, samples: number, direct: boolean)
   self.samples = samples
@@ -784,116 +552,20 @@ function init(self: VRScene, context: Context): boolean
       end
     end
   end
-
   local shader = context:shader('scene_lit')
-  local menuShader = context:shader('menu_quad')
-  if shader == nil or menuShader == nil then
-    print('VRScene: missing shader scene_lit or menu_quad')
+  if shader == nil then
+    print('VRScene: missing shader scene_lit')
     return false
   end
   self.litShader = shader
-  self.menuShader = menuShader
-
-  -- Helmet: PBR pipeline, mesh from its chunk modules, textures from image
-  -- assets (drawn into canvases once, since image asset views sample zero).
-  local helmetShader = context:shader('helmet_pbr')
-  if helmetShader then
-    self.helmetShader = helmetShader
-    local okMesh, mesh = pcall(function(): any
-      return require('model/HelmetMesh').load()
-    end)
-    if okMesh then
-      self.helmet = mesh :: HelmetMesh
-    else
-      print('VRScene: helmet mesh failed (' .. tostring(mesh) .. ')')
-    end
-    for _, name in HELMET_TEXTURES do
-      local image = context:image(name)
-      if image then
-        table.insert(self.helmetImages, image)
-        table.insert(self.helmetCanvases, context:canvas({ width = image.width, height = image.height }))
-      else
-        print('VRScene: missing image ' .. name)
-      end
-    end
-    self.helmetSampler = GPUSampler.new({ min = 'linear', mag = 'linear', wrapU = 'repeat', wrapV = 'repeat' })
-  else
-    print('VRScene: missing shader helmet_pbr')
-  end
-
   self.cubeVerts = vertexBuffer(cubeData())
   self.floorVerts = vertexBuffer(floorData())
-  self.quadVerts = vertexBuffer(quadData())
   self.sampler = ImageSampler('clamp', 'clamp', 'nearest')
-  self.menuSampler = GPUSampler.new({ min = 'linear', mag = 'linear' })
-
-  -- The Menu artboard, drawn into its own canvas each frame.
-  local ok, err = pcall(function()
-    local menuVm = Data.Menu.new()
-    self.menuVm = menuVm
-    self.menuInstance = self.menu:instance(menuVm)
-  end)
-  if not ok then
-    print('VRScene: no menu artboard (' .. tostring(err) .. ')')
-  end
-  self.menuCanvas = context:canvas({ width = MENU_W, height = MENU_H })
-  refreshMenuText(self)
   return true
 end
 
 function advance(self: VRScene, seconds: number): boolean
   locomote(self, seconds)
-  if self.spinOn then
-    self.spinAngle += 0.5 * seconds
-  end
-  -- Placed once from the head pose; squeezing both triggers re-places it.
-  local bothTriggers = num(self, 'triggerL') > 0.9 and num(self, 'triggerR') > 0.9
-  if not self.menuPlaced or bothTriggers then
-    placeMenu(self)
-  end
-
-  -- Rays: hover and trigger presses on the menu.
-  local hovered: { boolean } = { false, false, false }
-  for h, hand in { 'L', 'R' } do
-    self.rayLength[h] = RAY_LENGTH
-    local trigger = num(self, 'trigger' .. hand)
-    if self.menuPlaced and num(self, 'active' .. hand) > 0.5 then
-      local t, x, y = hitMenu(self, hand)
-      if t then
-        self.rayLength[h] = t
-        local b = buttonAt(x, y)
-        if b > 0 then
-          hovered[b] = true
-          if trigger >= PRESS_THRESHOLD and self.lastTrigger[h] < PRESS_THRESHOLD then
-            pressButton(self, b)
-          end
-        end
-      end
-    end
-    self.lastTrigger[h] = trigger
-  end
-
-  -- Ease hover in and out, decay press flashes, push colours to the menu.
-  local vm = self.menuVm
-  local ease = math.min(1, seconds * 12)
-  for b = 1, 3 do
-    self.hover[b] += ((if hovered[b] then 1 else 0) - self.hover[b]) * ease
-    self.flash[b] = math.max(0, self.flash[b] - seconds * 3)
-    if vm then
-      local colour = Color.lerp(Color.lerp(BTN_IDLE, BTN_HOVER, self.hover[b]), BTN_PRESS, self.flash[b])
-      if b == 1 then
-        vm.bgColour.value = colour
-      elseif b == 2 then
-        vm.bgSpin.value = colour
-      else
-        vm.bgGrid.value = colour
-      end
-    end
-  end
-  local instance = self.menuInstance
-  if instance then
-    instance:advance(seconds)
-  end
   return true
 end
 
@@ -905,10 +577,8 @@ local function writeMat(b: buffer, offset: number, m: { number })
   end
 end
 
-type EyeDraws = { activeHands: { number }, helmet: boolean, menu: boolean }
-
--- Writes this eye's uniforms; returns what encodeEye should draw.
-local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
+-- Writes this eye's uniforms; returns the hands to draw.
+local function prepareEye(self: VRScene, eye: Eye, prefix: string): { number }
   local ex, ey, ez, er = poseOf(self, prefix .. '_')
   local proj = projection(
     num(self, prefix .. '_fovL'), num(self, prefix .. '_fovR'),
@@ -936,17 +606,13 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
     ubo:write(staging)
   end
 
-  local swatch = CUBE_COLOURS[self.colourIndex]
   for i, o in OBJECTS do
-    if o.mesh == 'floor' then
-      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, 0, o.sx, o.sy, o.sz),
-        o.r, o.g, o.b, if self.gridOn then 1 else 0)
-    else
-      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, if o.spins then self.spinAngle else 0,
-        o.sx, o.sy, o.sz), o.r, o.g, o.b, 0)
-    end
+    writeDraw(eye.ubos[i], boxModel(o.x, o.y, o.z, o.sx, o.sy, o.sz),
+      o.r, o.g, o.b, if o.mesh == 'floor' then 1 else 0)
   end
 
+  -- Controllers: a box at the grip (where it touches, while touching) and a
+  -- ray along the aim.
   local activeHands: { number } = {}
   for h, hand in { 'L', 'R' } do
     if num(self, 'active' .. hand) > 0.5 then
@@ -958,53 +624,20 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
         gx, gy, gz = handState.x, handState.y, handState.z
       end
       local ax, ay, az, ar = poseOf(self, 'aim' .. hand .. '_')
-      local len = self.rayLength[h]
       local base = #OBJECTS + (h - 1) * 2
       writeDraw(eye.ubos[base + 1],
         poseModel(gx, gy, gz, gr, BOX_SIZE[1], BOX_SIZE[2], BOX_SIZE[3], 0, 0, 0),
         0.55 + 0.4 * t, 0.57 + 0.03 * t, 0.62 - 0.42 * t, 0)
       writeDraw(eye.ubos[base + 2],
-        poseModel(ax, ay, az, ar, RAY_WIDTH, RAY_WIDTH, len, 0, 0, -len / 2),
+        poseModel(ax, ay, az, ar, RAY_WIDTH, RAY_WIDTH, RAY_LENGTH, 0, 0, -RAY_LENGTH / 2),
         0.45 + 0.55 * t, 0.75 + 0.25 * t, 1, 2)
     end
   end
-
-  local helmet = self.helmet
-  local drawHelmet = helmet ~= nil and eye.helmetGroup ~= nil and self.helmetBaked and self.menuPlaced
-  if drawHelmet then
-    local hs = self.helmetStaging
-    writeMat(hs, 0, viewProj)
-    local bob = math.sin(self.spinAngle * 2.6) * 0.015
-    writeMat(hs, 64, yawModel(self.helmetX, self.helmetY + bob, self.helmetZ, self.spinAngle,
-      HELMET_SCALE, HELMET_SCALE, HELMET_SCALE))
-    buffer.writef32(hs, 128, ex)
-    buffer.writef32(hs, 132, ey)
-    buffer.writef32(hs, 136, ez)
-    buffer.writef32(hs, 140, 1)
-    -- Key light: half white, half the selected swatch.
-    buffer.writef32(hs, 144, 0.5 + 0.5 * swatch.r)
-    buffer.writef32(hs, 148, 0.5 + 0.5 * swatch.g)
-    buffer.writef32(hs, 152, 0.5 + 0.5 * swatch.b)
-    buffer.writef32(hs, 156, 3.2)
-    eye.helmetUbo:write(hs)
-  end
-
-  local drawMenu = self.menuPlaced and eye.menuGroup ~= nil
-  if drawMenu then
-    local ms = self.menuStaging
-    writeMat(ms, 0, viewProj)
-    writeMat(ms, 64, yawModel(self.menuX, self.menuY, self.menuZ, self.menuYaw,
-      MENU_SIZE_X, MENU_SIZE_Y, 1))
-    eye.menuUbo:write(ms)
-  end
-
-  return { activeHands = activeHands, helmet = drawHelmet, menu = drawMenu }
+  return activeHands
 end
 
 -- Issues one eye's draws into an open pass.
-local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, d: EyeDraws)
-  local activeHands = d.activeHands
-  local helmet = self.helmet
+local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, activeHands: { number })
   pass:setPipeline(self.pipeline :: GPUPipeline)
   for i, o in OBJECTS do
     pass:setBindGroup(0, eye.groups[i])
@@ -1016,29 +649,10 @@ local function encodeEye(self: VRScene, pass: GPURenderPass, eye: Eye, d: EyeDra
       pass:draw(36)
     end
   end
-  if d.helmet and helmet then
-    pass:setPipeline(self.helmetPipeline :: GPUPipeline)
-    pass:setBindGroup(0, eye.helmetGroup :: GPUBindGroup)
-    pass:setVertexBuffer(0, helmet.vertices)
-    pass:setIndexBuffer(helmet.indices, 'uint16')
-    pass:drawIndexed(helmet.indexCount)
-    pass:setPipeline(self.pipeline :: GPUPipeline)
-  end
-  -- Controller boxes, then the menu, then rays on top of it.
   pass:setVertexBuffer(0, self.cubeVerts :: GPUBuffer)
   for _, h in activeHands do
     pass:setBindGroup(0, eye.groups[#OBJECTS + (h - 1) * 2 + 1])
     pass:draw(36)
-  end
-  if d.menu then
-    pass:setPipeline(self.menuPipeline :: GPUPipeline)
-    pass:setBindGroup(0, eye.menuGroup :: GPUBindGroup)
-    pass:setVertexBuffer(0, self.quadVerts :: GPUBuffer)
-    pass:draw(6)
-    pass:setPipeline(self.pipeline :: GPUPipeline)
-  end
-  pass:setVertexBuffer(0, self.cubeVerts :: GPUBuffer)
-  for _, h in activeHands do
     pass:setBindGroup(0, eye.groups[#OBJECTS + (h - 1) * 2 + 2])
     pass:draw(36)
   end
@@ -1048,7 +662,7 @@ local CLEAR: GPUColor = { 0.04, 0.05, 0.08, 1 }
 
 -- Canvas path: one pass per eye into its gpuCanvas.
 local function renderEyeToCanvas(self: VRScene, eye: Eye, prefix: string)
-  local d = prepareEye(self, eye, prefix)
+  local hands = prepareEye(self, eye, prefix)
   local canvas = eye.canvas :: GPUCanvas
   local msaa = eye.msaaView
   local pass = canvas:beginRenderPass({
@@ -1067,14 +681,14 @@ local function renderEyeToCanvas(self: VRScene, eye: Eye, prefix: string)
     },
     label = prefix,
   })
-  encodeEye(self, pass, eye, d)
+  encodeEye(self, pass, eye, hands)
   pass:finish()
 end
 
 -- Direct path: both eyes in one pass, resolved into the host's target.
 local function renderDirect(self: VRScene, target: GPUTarget, targetView: GPUTextureView)
   local w, h = self.width, self.height
-  local draws = { prepareEye(self, self.eyes[1], 'eyeL'), prepareEye(self, self.eyes[2], 'eyeR') }
+  local hands = { prepareEye(self, self.eyes[1], 'eyeL'), prepareEye(self, self.eyes[2], 'eyeR') }
   local msaa = self.directMsaa
   local pass = target:beginRenderPass({
     color = { {
@@ -1095,7 +709,7 @@ local function renderDirect(self: VRScene, target: GPUTarget, targetView: GPUTex
   for e = 1, 2 do
     pass:setViewport((e - 1) * w, 0, w, h)
     pass:setScissorRect((e - 1) * w, 0, w, h)
-    encodeEye(self, pass, self.eyes[e], draws[e])
+    encodeEye(self, pass, self.eyes[e], hands[e])
   end
   pass:finish()
 end
@@ -1134,25 +748,6 @@ function draw(self: VRScene, renderer: Renderer)
     seen.value = num(self, 'frameIndex')
   end
 
-  -- Menu artboard into its canvas; the eye passes sample it.
-  local menuCanvas = self.menuCanvas
-  local instance = self.menuInstance
-  if menuCanvas and instance then
-    local menuRenderer = menuCanvas:beginFrame({ clearColor = 0 })
-    instance:draw(menuRenderer)
-    menuCanvas:endFrame()
-  end
-
-  -- Helmet textures: draw each image asset into its canvas once.
-  if not self.helmetBaked and #self.helmetCanvases == #HELMET_TEXTURES then
-    for i, canvas in self.helmetCanvases do
-      local r = canvas:beginFrame({ clearColor = 0 })
-      r:drawImage(self.helmetImages[i], self.sampler :: ImageSampler, 'srcOver', 1)
-      canvas:endFrame()
-    end
-    self.helmetBaked = true
-  end
-
   if target then
     local view = target.view
     if view then
@@ -1173,26 +768,9 @@ end
 
 return function(): Node<VRScene>
   return {
-    menu = late(),
-    menuInstance = nil,
-    menuVm = nil,
-    menuCanvas = nil,
-    menuPipeline = nil,
-    menuSampler = nil,
-    quadVerts = nil,
-    helmet = nil,
-    helmetPipeline = nil,
-    helmetImages = {},
-    helmetCanvases = {},
-    helmetSampler = nil,
-    helmetBaked = false,
-    helmetX = 0, helmetY = 1.3, helmetZ = -1.3,
-    helmetStaging = buffer.create(HELMET_UBO_SIZE),
     props = {},
     eyes = {},
     litShader = nil,
-    menuShader = nil,
-    helmetShader = nil,
     config = '',
     samples = DEFAULT_SAMPLES,
     direct = false,
@@ -1207,13 +785,6 @@ return function(): Node<VRScene>
     width = 0,
     height = 0,
     staging = buffer.create(UBO_SIZE),
-    menuStaging = buffer.create(MENU_UBO_SIZE),
-    spinOn = true,
-    gridOn = true,
-    colourIndex = 1,
-    spinAngle = 0,
-    menuPlaced = false,
-    menuX = 0, menuY = 0, menuZ = 0, menuYaw = 0,
     rigX = 0, rigY = 0, rigZ = 0,
     velX = 0, velY = 0, velZ = 0,
     hands = {
@@ -1221,10 +792,6 @@ return function(): Node<VRScene>
       { touching = false, ready = false, x = 0, y = 0, z = 0 },
     },
     history = {},
-    hover = { 0, 0, 0 },
-    flash = { 0, 0, 0 },
-    rayLength = { RAY_LENGTH, RAY_LENGTH },
-    lastTrigger = { 0, 0 },
     init = init,
     advance = advance,
     draw = draw,
