@@ -112,6 +112,10 @@ public:
 
     rive::gpu::RenderContext* renderContext() override { return m_rc; }
 
+    // Direct path: the swapchain image Ore passes resolve into.
+    void setDirectTarget(rive::gpu::RenderTarget* target) { m_directTarget = target; }
+    rive::gpu::RenderTarget* targetRenderTarget() override { return m_directTarget; }
+
     rive::Renderer* beginScreen(uint64_t, bool clear, uint32_t color) override
     {
         rive::gpu::RenderContext::FrameDescriptor fd;
@@ -130,6 +134,7 @@ private:
     uint32_t m_width;
     uint32_t m_height;
     std::unique_ptr<rive::RiveRenderer> m_renderer;
+    rive::gpu::RenderTarget* m_directTarget = nullptr;
 };
 
 struct App
@@ -184,6 +189,10 @@ struct App
     std::unique_ptr<rive::StateMachineInstance> stateMachine;
     rive::rcp<rive::ViewModelInstanceRuntime> viewModel;
     bool stereo = false;
+    // debug.rivevr.direct: scripts render straight into the swapchain.
+    bool direct = false;
+    // debug.rivevr.msaa: sample count the scene script renders with.
+    int msaa = 4;
     rive::ViewModelInstanceNumberRuntime* eyeProps[2][11] = {};
     rive::ViewModelInstanceNumberRuntime* frameIndexProp = nullptr;
     rive::ViewModelInstanceNumberRuntime* seenFrameProp = nullptr;
@@ -572,6 +581,9 @@ bool createSwapchain(App& app, uint32_t width, uint32_t height)
     app.swapchainHeight = height;
     app.renderTarget =
         rive::make_rcp<rive::gpu::TextureRenderTargetGL>(width, height);
+    // GL Ore can only wrap a top-down target; the script flips its
+    // projection to compensate (see VRScene).
+    app.renderTarget->setBottomUp(!app.direct);
     LOGI("Swapchain: %u images, %ux%u", imageCount, width, height);
     return true;
 }
@@ -592,6 +604,14 @@ bool readFile(const std::string& path, std::vector<uint8_t>& out)
     return read == out.size();
 }
 
+void setNumber(App& app, const char* name, float value)
+{
+    if (auto* prop = app.viewModel ? app.viewModel->propertyNumber(name) : nullptr)
+    {
+        prop->value(value);
+    }
+}
+
 bool initRive(App& app)
 {
     app.rc = rive::gpu::RenderContextGLImpl::MakeContext();
@@ -610,6 +630,23 @@ bool initRive(App& app)
         rive::ore::ReplayCaps::from(*ore));
     app.riveSession->bindRenderContext(app.rc.get());
     app.target = app.riveSession->acquireScreenTarget();
+    app.direct = sysPropEnabled("debug.rivevr.direct", false);
+    app.msaa = (int)sysPropFloat("debug.rivevr.msaa", 4.0f);
+    if (app.direct)
+    {
+        app.riveSession->oreContext().setExposesTarget(true);
+        // GLES 3 can't resolve an RGBA8 MSAA buffer into an sRGB texture (the
+        // formats must match), so with the default sRGB swapchain the direct
+        // path renders without MSAA. Use debug.rivevr.srgb 0 for direct+MSAA
+        // (colours then come out washed out until shaders output linear).
+        if (app.msaa > 1 && sysPropEnabled("debug.rivevr.srgb", true))
+        {
+            LOGE("direct + sRGB swapchain: MSAA %d not supported, using 1",
+                 app.msaa);
+            app.msaa = 1;
+        }
+    }
+    LOGI("Render path: %s, msaa %d", app.direct ? "direct" : "canvas", app.msaa);
     app.host.bindSession(app.riveSession.get(), app.target);
 
     const std::string path =
@@ -710,6 +747,8 @@ bool initRive(App& app)
             app.eyeWidthProp->value((float)app.eyeWidth);
         if (app.eyeHeightProp)
             app.eyeHeightProp->value((float)app.eyeHeight);
+        setNumber(app, "msaa", (float)app.msaa);
+        setNumber(app, "direct", app.direct ? 1.0f : 0.0f);
         // The artboard is the double-wide eye image, pixel for pixel.
         app.artboard->width((float)(app.eyeWidth * 2));
         app.artboard->height((float)app.eyeHeight);
@@ -899,7 +938,14 @@ void recordRive(App& app, float dt)
     }
 
     app.riveSession->beginTargetFrame(app.target);
-    app.host.beginRecord(true, 0xff000000u);
+    rive::ore::Context::TargetDesc targetDesc;
+    if (app.direct)
+    {
+        targetDesc = rive::ore::Context::TargetDesc::color8(app.swapchainWidth,
+                                                            app.swapchainHeight,
+                                                            false);
+    }
+    app.host.beginRecord(true, 0xff000000u, targetDesc);
     rive::Renderer* renderer = app.host.screenRenderer();
     renderer->save();
     renderer->align(app.stereo ? rive::Fit::fill : rive::Fit::contain,
@@ -929,6 +975,10 @@ bool replayRive(App& app, GLuint texture)
                        app.target,
                        app.swapchainWidth,
                        app.swapchainHeight);
+    if (app.direct)
+    {
+        sink.setDirectTarget(app.renderTarget.get());
+    }
     const uint64_t frame = ++app.frameNumber;
     return app.host.replayInline(sink, [&] {
         rive::gpu::RenderContext::FlushResources flush;

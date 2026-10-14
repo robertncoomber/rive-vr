@@ -5,6 +5,9 @@ For payloads too large to pass by hand: generated scripts and image assets.
 
   rive_mcp.py script <rive/path> <file.luau>   create a Luau utility script
   rive_mcp.py image <asset-name> <file.png|jpg> upload an image asset
+  rive_mcp.py sync <rive/path> <file.luau>     replace an existing script's
+                                               source with the file, recompile
+                                               and print diagnostics
 """
 
 import base64
@@ -57,9 +60,19 @@ def main():
         filename = urllib.parse.quote(os.path.basename(path))
         out = call('upload_asset', {'file': f'data:{mime};name={filename};base64,{data}',
                                     'name': name})
+    elif kind == 'sync':
+        current = call('text_editor', {'command': 'view', 'path': name})
+        if current.startswith('{'):
+            current = json.loads(current)['content']
+        new = open(path).read()
+        if current != new:
+            call('text_editor', {'command': 'str_replace', 'path': name,
+                                 'old_string': current, 'new_string': new})
+        call('recompile_all_scripts', {})
+        out = call('script_diagnostics', {'path': name})
     else:
         sys.exit(__doc__)
-    print(out[:400])
+    print(out[:2000])
 
 
 if __name__ == '__main__':
