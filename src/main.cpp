@@ -27,6 +27,8 @@
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/artboard.hpp"
 #include "rive/file.hpp"
+#include "rive/lua/rive_lua_libs.hpp"
+#include "rive/lua/scripting_vm.hpp"
 #include "rive/renderer/cmd/deferred_host.hpp"
 #include "rive/renderer/cmd/deferred_session.hpp"
 #include "rive/renderer/gl/render_context_gl_impl.hpp"
@@ -36,6 +38,8 @@
 #include "rive/viewmodel/runtime/viewmodel_runtime.hpp"
 
 #include <chrono>
+#include <pthread.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -173,6 +177,7 @@ struct App
     rive::cmd::DeferredInlineHost host;
     uint64_t target = 0;
     rive::rcp<rive::gpu::TextureRenderTargetGL> renderTarget;
+    rive::rcp<rive::ScriptingVM> scriptingVM;
     rive::rcp<rive::File> file;
     std::unique_ptr<rive::ArtboardInstance> artboard;
     std::unique_ptr<rive::StateMachineInstance> stateMachine;
@@ -551,8 +556,17 @@ bool initRive(App& app)
         LOGE("Could not read %s (push one with tools/push.sh)", path.c_str());
         return false;
     }
+    // Our own scripting VM so scripts get a 5 s budget per call instead of the
+    // runtime's default 200 ms (decoding a model at init needs more).
+    app.scriptingVM = rive::make_rcp<rive::ScriptingVM>(
+        std::make_unique<rive::CPPRuntimeScriptingContext>(app.riveSession.get(),
+                                                           5000));
     rive::ImportResult result;
-    app.file = rive::File::import(bytes, app.riveSession.get(), &result);
+    app.file = rive::File::import(bytes,
+                                  app.riveSession.get(),
+                                  &result,
+                                  (rive::FileAssetLoader*)nullptr,
+                                  app.scriptingVM.get());
     if (!app.file)
     {
         LOGE("File::import failed: %d", (int)result);
@@ -1028,6 +1042,48 @@ void handleAppCmd(android_app* android, int32_t cmd)
 }
 } // namespace
 
+// Luau print() and script errors go to stdout/stderr, which Android drops.
+// Pipe both into logcat under the "RiveScript" tag.
+void startStdioLogging()
+{
+    static int fds[2];
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (pipe(fds) != 0)
+    {
+        return;
+    }
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    pthread_t thread;
+    pthread_create(
+        &thread,
+        nullptr,
+        [](void*) -> void* {
+            char buf[1024];
+            std::string line;
+            ssize_t n;
+            while ((n = read(fds[0], buf, sizeof(buf))) > 0)
+            {
+                for (ssize_t i = 0; i < n; ++i)
+                {
+                    if (buf[i] == '\n')
+                    {
+                        __android_log_write(ANDROID_LOG_INFO, "RiveScript", line.c_str());
+                        line.clear();
+                    }
+                    else
+                    {
+                        line += buf[i];
+                    }
+                }
+            }
+            return nullptr;
+        },
+        nullptr);
+    pthread_detach(thread);
+}
+
 void android_main(android_app* android)
 {
     App app;
@@ -1035,6 +1091,7 @@ void android_main(android_app* android)
     android->userData = &app;
     android->onAppCmd = handleAppCmd;
 
+    startStdioLogging();
     LOGI("rive-vr starting");
     if (!initEGL(app) || !initOpenXR(app) || !initRive(app))
     {

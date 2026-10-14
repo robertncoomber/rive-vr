@@ -8,6 +8,7 @@ set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(RIVE ${ROOT}/third_party/rive-runtime)
 set(RIVE_OUT ${RIVE}/renderer/out/android_arm64_release)
 set(OPENXR ${ROOT}/third_party/openxr/aar/prefab/modules)
+file(GLOB LUAU_VM_INCLUDE ${RIVE}/renderer/dependencies/*luau*/VM/include)
 
 # Must match the defines rive-runtime was built with, or class layouts differ.
 set(RIVE_DEFINES
@@ -33,7 +34,8 @@ target_include_directories(main PRIVATE
     ${RIVE}/include
     ${RIVE}/renderer/include
     ${RIVE}/decoders/include
-    ${RIVE}/scripting)
+    ${RIVE}/scripting
+    ${LUAU_VM_INCLUDE})
 
 target_link_options(main PRIVATE -flto -u ANativeActivity_onCreate)
 target_link_libraries(main PRIVATE
