@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Calls tools on the Rive desktop editor's local MCP server (port 9791).
+
+For payloads too large to pass by hand: generated scripts and image assets.
+
+  rive_mcp.py script <rive/path> <file.luau>   create a Luau utility script
+  rive_mcp.py image <asset-name> <file.png|jpg> upload an image asset
+"""
+
+import base64
+import json
+import mimetypes
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+URL = 'http://127.0.0.1:9791/mcp'
+HEADERS = {'Content-Type': 'application/json',
+           'Accept': 'application/json, text/event-stream'}
+
+
+def post(body, session=None):
+    headers = dict(HEADERS)
+    if session:
+        headers['mcp-session-id'] = session
+    req = urllib.request.Request(URL, json.dumps(body).encode(), headers)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        raw = resp.read().decode()
+        sid = resp.headers.get('mcp-session-id')
+    lines = [l[5:].strip() for l in raw.splitlines() if l.startswith('data:')]
+    return json.loads(lines[-1] if lines else raw), sid
+
+
+def call(tool, arguments):
+    _, sid = post({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                   'params': {'protocolVersion': '2025-11-25', 'capabilities': {},
+                              'clientInfo': {'name': 'rive-vr', 'version': '1'}}})
+    result, _ = post({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                      'params': {'name': tool, 'arguments': arguments}}, sid)
+    if 'error' in result:
+        sys.exit(json.dumps(result['error']))
+    return result['result']['content'][0]['text']
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit(__doc__)
+    kind, name, path = sys.argv[1:]
+    if kind == 'script':
+        content = open(path).read()
+        out = call('manage_scripts', {'command': 'create', 'data': {
+            'create': [{'name': name, 'code_file_type': 'luau', 'content': content}]}})
+    elif kind == 'image':
+        mime = mimetypes.guess_type(path)[0] or 'image/png'
+        data = base64.b64encode(open(path, 'rb').read()).decode()
+        filename = urllib.parse.quote(os.path.basename(path))
+        out = call('upload_asset', {'file': f'data:{mime};name={filename};base64,{data}',
+                                    'name': name})
+    else:
+        sys.exit(__doc__)
+    print(out[:400])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,30 @@
+{
+  "source": "DamagedHelmet.glb",
+  "vertexCount": 14556,
+  "indexCount": 46356,
+  "vertexBytes": 465792,
+  "totalBytes": 558504,
+  "chunks": 8,
+  "boundsMin": [
+    -0.9474585652351379,
+    -0.9009741103874731,
+    -1.187155129805747
+  ],
+  "boundsMax": [
+    0.9424954056739807,
+    0.9009951350576428,
+    0.8128451260791926
+  ],
+  "textures": {
+    "baseColor": "baseColor.jpg",
+    "metalRough": "metalRough.jpg",
+    "normal": "normal.jpg",
+    "emissive": "emissive.jpg",
+    "occlusion": "occlusion.jpg"
+  },
+  "emissiveFactor": [
+    1,
+    1,
+    1
+  ]
+}
