@@ -411,6 +411,9 @@ end
 local HAND_RADIUS = 0.06
 local HAND_RELEASE = 0.03 -- how far a stuck hand may lift off before letting go
 local FEET_RADIUS = 0.2
+-- The body hangs this far below the head (1.5 ft), gorilla style: the feet
+-- rest here, not at your real floor, so the ground stays within arm's reach.
+local BODY_HEIGHT = 0.46
 local HEAD_RADIUS = 0.15
 local GRAVITY = 9.8
 local JUMP_MULTIPLIER = 1.1
@@ -554,11 +557,12 @@ local function locomote(self: VRScene, seconds: number)
     self.rigZ += self.velZ * dt
   end
 
-  -- Body: feet under the head and the head itself push out of geometry.
+  -- Body: a short body under the head, and the head itself, push out of
+  -- geometry.
   local hx = self.rigX + num(self, 'eyeL_px')
   local hy = self.rigY + num(self, 'eyeL_py')
   local hz = self.rigZ + num(self, 'eyeL_pz')
-  local px, py, pz = pushOut(hx, self.rigY + FEET_RADIUS, hz, FEET_RADIUS)
+  local px, py, pz = pushOut(hx, hy - BODY_HEIGHT + FEET_RADIUS, hz, FEET_RADIUS)
   self.rigX += px
   self.rigY += py
   self.rigZ += pz
