@@ -7,7 +7,8 @@
 // times a second), which made remote players move at ~5 fps; unicast is
 // delivered as it comes.
 //
-// Packets carry the sender's clock. Remote poses are rendered kInterpDelay
+// Packets carry the sender's clock. Remote poses are rendered kInterpDelay (130 ms;
+// Quest Wi-Fi shows occasional 125 ms gaps)
 // behind the newest packet on that clock (the clock offset is the smallest
 // recent arrival-minus-send gap, which filters out Wi-Fi queueing) and are
 // interpolated between the packets either side, so leftover jitter is hidden.
@@ -36,7 +37,7 @@ class LanSession
 {
 public:
     static constexpr uint16_t kPort = 47777;
-    static constexpr double kInterpDelay = 0.08;
+    static constexpr double kInterpDelay = 0.13;
     static constexpr double kTimeout = 2.0;
     static constexpr double kHelloInterval = 0.5;
 
