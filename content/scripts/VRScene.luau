@@ -64,16 +64,36 @@ type Eye = {
 
 type Obj = {
   mesh: string, -- 'cube' | 'floor'
-  x: number, y: number, z: number,
-  scale: number,
+  x: number, y: number, z: number, -- centre
+  sx: number, sy: number, sz: number, -- size (floor: half extents)
   spins: boolean,
   r: number, g: number, b: number,
 }
 
+-- A playground to climb and jump around on: steps, towers, pillars, a back
+-- wall and a floating bridge. Boxes are axis aligned, so they double as
+-- colliders. box(x, z, w, h, d) stands on the floor; y overrides its base.
+local function box(x: number, z: number, w: number, h: number, d: number,
+                   r: number, g: number, b: number, base: number?): Obj
+  local y0 = base or 0
+  return { mesh = 'cube', x = x, y = y0 + h / 2, z = z, sx = w, sy = h, sz = d,
+           spins = false, r = r, g = g, b = b }
+end
+
 local OBJECTS: { Obj } = {
-  { mesh = 'floor', x = 0, y = 0, z = 0, scale = 10, spins = false, r = 0.09, g = 0.1, b = 0.13 },
-  { mesh = 'cube', x = -0.7, y = 0.9, z = -1.2, scale = 0.25, spins = false, r = 0.3, g = 0.7, b = 0.95 },
-  { mesh = 'cube', x = 0.8, y = 1.3, z = -2.2, scale = 0.35, spins = false, r = 0.55, g = 0.85, b = 0.4 },
+  { mesh = 'floor', x = 0, y = 0, z = 0, sx = 15, sy = 1, sz = 15, spins = false, r = 0.09, g = 0.1, b = 0.13 },
+  box(1.7, -1.8, 1.2, 0.6, 1.2, 0.95, 0.55, 0.25),
+  box(3.2, -3.0, 1.2, 1.2, 1.2, 0.9, 0.4, 0.35),
+  box(4.6, -4.6, 1.2, 1.9, 1.2, 0.8, 0.3, 0.45),
+  box(2.6, -6.4, 1.4, 2.7, 1.4, 0.6, 0.35, 0.75),
+  box(-1.9, -2.6, 2.0, 0.4, 2.0, 0.3, 0.7, 0.9),
+  box(-3.6, -4.0, 1.6, 1.0, 1.6, 0.25, 0.55, 0.85),
+  box(-2.2, -6.0, 1.2, 1.8, 1.2, 0.35, 0.8, 0.6),
+  box(0.2, -8.2, 8.0, 3.4, 0.5, 0.45, 0.5, 0.6),
+  box(0.2, -6.3, 3.4, 0.25, 0.8, 0.95, 0.8, 0.3, 2.5),
+  box(-5.6, -1.2, 0.5, 2.6, 0.5, 0.55, 0.85, 0.45),
+  box(5.8, -1.4, 0.5, 2.6, 0.5, 0.55, 0.85, 0.45),
+  box(0.0, 3.5, 3.0, 0.9, 1.2, 0.85, 0.75, 0.5),
 }
 local CONTROLLER_DRAWS = 4 -- box L, ray L, box R, ray R
 
@@ -87,6 +107,8 @@ local HELMET_SCALE = 0.24
 local HELMET_UBO_SIZE = 160 -- mat4 viewProj, mat4 model, vec4 camPos, vec4 light
 
 type HelmetMesh = { vertices: GPUBuffer, indices: GPUBuffer, vertexCount: number, indexCount: number }
+
+type Hand = { pinned: boolean, x: number, y: number, z: number }
 
 type VRScene = {
   menu: Input<Artboard<Data.Menu>>,
@@ -132,6 +154,12 @@ type VRScene = {
   -- Menu placement (set once from the head pose) and interaction
   menuPlaced: boolean,
   menuX: number, menuY: number, menuZ: number, menuYaw: number,
+  -- Locomotion: the rig is where the play space sits in the world.
+  rigX: number, rigY: number, rigZ: number,
+  velX: number, velY: number, velZ: number,
+  airborne: boolean,
+  hands: { Hand },
+  history: { { number } }, -- recent rig moves while a hand is stuck: dx, dy, dz, dt
   hover: { number },     -- per button 0..1, eased
   flash: { number },     -- per button 0..1, decays after a press
   rayLength: { number }, -- per hand
@@ -286,8 +314,10 @@ local function num(self: VRScene, name: string): number
   return if p then p.value else 0
 end
 
+-- World pose of a tracked thing: its play-space pose shifted by the rig.
 local function poseOf(self: VRScene, prefix: string): (number, number, number, { { number } })
-  return num(self, prefix .. 'px'), num(self, prefix .. 'py'), num(self, prefix .. 'pz'),
+  return self.rigX + num(self, prefix .. 'px'), self.rigY + num(self, prefix .. 'py'),
+    self.rigZ + num(self, prefix .. 'pz'),
     quatRows(num(self, prefix .. 'qx'), num(self, prefix .. 'qy'),
              num(self, prefix .. 'qz'), num(self, prefix .. 'qw'))
 end
@@ -369,6 +399,189 @@ local function buttonAt(x: number, y: number): number
     end
   end
   return 0
+end
+
+-- ---------------------------------------------------------------- locomotion
+-- Gorilla Tag style, no sticks. A hand that touches a surface sticks there,
+-- and moving that hand moves the body the opposite way: push down to rise,
+-- pull back to go forward, climb hand over hand. Letting go while moving
+-- launches the body with its recent velocity. Feet and head spheres keep
+-- the body out of the geometry; gravity applies while no hand is stuck.
+
+local HAND_RADIUS = 0.06
+local HAND_RELEASE = 0.03 -- how far a stuck hand may lift off before letting go
+local FEET_RADIUS = 0.2
+local HEAD_RADIUS = 0.15
+local GRAVITY = 9.8
+local JUMP_MULTIPLIER = 1.1
+local MAX_JUMP_SPEED = 6.5
+local HISTORY = 5
+local GROUND_FRICTION = 10
+
+type Box = { x0: number, x1: number, y0: number, y1: number, z0: number, z1: number }
+local COLLIDERS: { Box } = {
+  { x0 = -1000, x1 = 1000, y0 = -10, y1 = 0, z0 = -1000, z1 = 1000 }, -- floor
+}
+for _, o in OBJECTS do
+  if o.mesh == 'cube' then
+    table.insert(COLLIDERS, {
+      x0 = o.x - o.sx / 2, x1 = o.x + o.sx / 2,
+      y0 = o.y - o.sy / 2, y1 = o.y + o.sy / 2,
+      z0 = o.z - o.sz / 2, z1 = o.z + o.sz / 2,
+    })
+  end
+end
+
+-- Distance from a point to the nearest collider (0 inside one).
+local function nearestDistance(x: number, y: number, z: number): number
+  local best = math.huge
+  for _, b in COLLIDERS do
+    local dx = math.max(b.x0 - x, 0, x - b.x1)
+    local dy = math.max(b.y0 - y, 0, y - b.y1)
+    local dz = math.max(b.z0 - z, 0, z - b.z1)
+    best = math.min(best, math.sqrt(dx * dx + dy * dy + dz * dz))
+  end
+  return best
+end
+
+-- Pushes a sphere out of the colliders it overlaps. Returns the push.
+local function pushOut(x: number, y: number, z: number, r: number): (number, number, number)
+  local px, py, pz = 0, 0, 0
+  for _ = 1, 2 do
+    for _, b in COLLIDERS do
+      local cx, cy, cz = x + px, y + py, z + pz
+      local dx = cx - math.clamp(cx, b.x0, b.x1)
+      local dy = cy - math.clamp(cy, b.y0, b.y1)
+      local dz = cz - math.clamp(cz, b.z0, b.z1)
+      local d2 = dx * dx + dy * dy + dz * dz
+      if d2 < r * r then
+        if d2 > 1e-10 then
+          local d = math.sqrt(d2)
+          local k = (r - d) / d
+          px += dx * k
+          py += dy * k
+          pz += dz * k
+        else
+          -- Centre inside the box: leave through the nearest face.
+          local moves: { { number } } = {
+            { b.x0 - r - cx, 0, 0 }, { b.x1 + r - cx, 0, 0 },
+            { 0, b.y0 - r - cy, 0 }, { 0, b.y1 + r - cy, 0 },
+            { 0, 0, b.z0 - r - cz }, { 0, 0, b.z1 + r - cz },
+          }
+          local best = moves[1]
+          for _, m in moves do
+            if math.abs(m[1] + m[2] + m[3]) < math.abs(best[1] + best[2] + best[3]) then
+              best = m
+            end
+          end
+          px += best[1]
+          py += best[2]
+          pz += best[3]
+        end
+      end
+    end
+  end
+  return px, py, pz
+end
+
+local function locomote(self: VRScene, seconds: number)
+  local dt = math.clamp(seconds, 1 / 240, 1 / 30)
+
+  -- Hands: stick on contact, unstick when lifted off.
+  local mx, my, mz, stuck = 0, 0, 0, 0
+  for h, hand in { 'L', 'R' } do
+    local st = self.hands[h]
+    if num(self, 'active' .. hand) > 0.5 then
+      local g = 'grip' .. hand .. '_'
+      local tx = self.rigX + num(self, g .. 'px')
+      local ty = self.rigY + num(self, g .. 'py')
+      local tz = self.rigZ + num(self, g .. 'pz')
+      if st.pinned and nearestDistance(tx, ty, tz) > HAND_RADIUS + HAND_RELEASE then
+        st.pinned = false
+      end
+      if not st.pinned then
+        local px, py, pz = pushOut(tx, ty, tz, HAND_RADIUS)
+        if px ~= 0 or py ~= 0 or pz ~= 0 then
+          st.pinned = true
+          st.x, st.y, st.z = tx + px, ty + py, tz + pz
+        end
+      end
+      if st.pinned then
+        mx += st.x - tx
+        my += st.y - ty
+        mz += st.z - tz
+        stuck += 1
+      end
+    else
+      st.pinned = false
+    end
+  end
+
+  if stuck > 0 then
+    -- The body moves so the stuck hands stay put.
+    local dx, dy, dz = mx / stuck, my / stuck, mz / stuck
+    self.rigX += dx
+    self.rigY += dy
+    self.rigZ += dz
+    table.insert(self.history, { dx, dy, dz, dt })
+    if #self.history > HISTORY then
+      table.remove(self.history, 1)
+    end
+    self.velX, self.velY, self.velZ = 0, 0, 0
+    self.airborne = false
+  else
+    if not self.airborne then
+      -- Just let go: launch with the recent hand-driven velocity.
+      local sx, sy, sz, st = 0, 0, 0, 0
+      for _, m in self.history do
+        sx += m[1]
+        sy += m[2]
+        sz += m[3]
+        st += m[4]
+      end
+      if st > 0 then
+        local vx, vy, vz = sx / st * JUMP_MULTIPLIER, sy / st * JUMP_MULTIPLIER, sz / st * JUMP_MULTIPLIER
+        local speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        local k = if speed > MAX_JUMP_SPEED then MAX_JUMP_SPEED / speed else 1
+        self.velX, self.velY, self.velZ = vx * k, vy * k, vz * k
+      end
+      self.history = {}
+      self.airborne = true
+    end
+    self.velY -= GRAVITY * dt
+    self.rigX += self.velX * dt
+    self.rigY += self.velY * dt
+    self.rigZ += self.velZ * dt
+  end
+
+  -- Body: feet under the head and the head itself push out of geometry.
+  local hx = self.rigX + num(self, 'eyeL_px')
+  local hy = self.rigY + num(self, 'eyeL_py')
+  local hz = self.rigZ + num(self, 'eyeL_pz')
+  local px, py, pz = pushOut(hx, self.rigY + FEET_RADIUS, hz, FEET_RADIUS)
+  self.rigX += px
+  self.rigY += py
+  self.rigZ += pz
+  if py > 0 and stuck == 0 then
+    -- Standing: stop falling and let friction stop sliding.
+    self.velY = math.max(self.velY, 0)
+    local f = math.max(0, 1 - GROUND_FRICTION * dt)
+    self.velX *= f
+    self.velZ *= f
+  end
+  px, py, pz = pushOut(hx + px, hy + py, hz + pz, HEAD_RADIUS)
+  self.rigX += px
+  self.rigY += py
+  self.rigZ += pz
+  if py < 0 and self.velY > 0 then
+    self.velY = 0
+  end
+
+  -- Fell out of the world: back to the start.
+  if self.rigY < -30 then
+    self.rigX, self.rigY, self.rigZ = 0, 0, 0
+    self.velX, self.velY, self.velZ = 0, 0, 0
+  end
 end
 
 -- ---------------------------------------------------------------- lifecycle
@@ -591,6 +804,7 @@ function init(self: VRScene, context: Context): boolean
 end
 
 function advance(self: VRScene, seconds: number): boolean
+  locomote(self, seconds)
   if self.spinOn then
     self.spinAngle += 0.5 * seconds
   end
@@ -687,14 +901,11 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
   local swatch = CUBE_COLOURS[self.colourIndex]
   for i, o in OBJECTS do
     if o.mesh == 'floor' then
-      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, 0, o.scale, o.scale, o.scale),
+      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, 0, o.sx, o.sy, o.sz),
         o.r, o.g, o.b, if self.gridOn then 1 else 0)
-    elseif o.spins then
-      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, self.spinAngle, o.scale, o.scale, o.scale),
-        swatch.r, swatch.g, swatch.b, 0)
     else
-      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, 0, o.scale, o.scale, o.scale),
-        o.r, o.g, o.b, 0)
+      writeDraw(eye.ubos[i], yawModel(o.x, o.y, o.z, if o.spins then self.spinAngle else 0,
+        o.sx, o.sy, o.sz), o.r, o.g, o.b, 0)
     end
   end
 
@@ -704,6 +915,10 @@ local function prepareEye(self: VRScene, eye: Eye, prefix: string): EyeDraws
       table.insert(activeHands, h)
       local t = math.clamp(num(self, 'trigger' .. hand), 0, 1)
       local gx, gy, gz, gr = poseOf(self, 'grip' .. hand .. '_')
+      local stuckHand = self.hands[h]
+      if stuckHand.pinned then
+        gx, gy, gz = stuckHand.x, stuckHand.y, stuckHand.z
+      end
       local ax, ay, az, ar = poseOf(self, 'aim' .. hand .. '_')
       local len = self.rayLength[h]
       local base = #OBJECTS + (h - 1) * 2
@@ -961,6 +1176,11 @@ return function(): Node<VRScene>
     spinAngle = 0,
     menuPlaced = false,
     menuX = 0, menuY = 0, menuZ = 0, menuYaw = 0,
+    rigX = 0, rigY = 0, rigZ = 0,
+    velX = 0, velY = 0, velZ = 0,
+    airborne = false,
+    hands = { { pinned = false, x = 0, y = 0, z = 0 }, { pinned = false, x = 0, y = 0, z = 0 } },
+    history = {},
     hover = { 0, 0, 0 },
     flash = { 0, 0, 0 },
     rayLength = { RAY_LENGTH, RAY_LENGTH },
