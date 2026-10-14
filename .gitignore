@@ -1,0 +1,10 @@
+.DS_Store
+.gradle/
+.idea/
+.cxx/
+build/
+local.properties
+*.apk
+node_modules/
+web-harness/dist/
+third_party/openxr/
