@@ -1,8 +1,8 @@
 # Rive VR
 
 A small, standalone Meta Quest playground built to explore **Rive as a VR
-rendering and gameplay runtime**. The current APK is **1.37 MB**, including
-the scene.
+rendering and gameplay runtime**. The current APK is about **800 KB**,
+including the scene, and runs at up to **207 Hz** on Quest 3.
 
 ## What we're doing
 
@@ -18,6 +18,8 @@ The playground includes:
 - Trees, branches, decks, practice steps, and a grid-lined central court.
 - Multiplayer over the same Wi-Fi network, with interpolated head/hand poses
   and small fallback name plates.
+- Right controller **A** cycles the refresh rate (up to 207 Hz on Quest 3,
+  shown briefly in front of you); **B** toggles foveated rendering.
 
 ## Why we're doing it
 
@@ -45,11 +47,15 @@ adb install -r build/rivevr.apk
 adb shell am start -n so.fluid.rivevr/android.app.NativeActivity
 ```
 
-The first build compiles the minimal, size-optimized Rive runtime (applying
-`tools/patches/size-opt.patch` to `third_party/rive-runtime` if needed). OpenXR
-goes through `src/xr_loader.cpp` instead of the Khronos loader; only the
-headers from `tools/fetch_openxr.sh` are used. With `advzip` installed
-(`brew install advancecomp`) the APK is recompressed with zopfli.
+The first build compiles a minimal, size-optimized Rive runtime with the
+patches in `tools/patches/`. Recommended headset settings:
+
+```bash
+adb shell "setprop debug.rivevr.direct 1; setprop debug.rivevr.msaa 1; setprop debug.rivevr.scale 1.2; setprop debug.rivevr.hz 207"
+```
+
+See [AGENTS.md](AGENTS.md) for how it all works: frame flow, build details,
+every `debug.rivevr.*` property, refresh rates, and performance notes.
 
 ## Edit the scene
 
@@ -57,7 +63,6 @@ headers from `tools/fetch_openxr.sh` are used. With `advzip` installed
 - `content/shaders/scene_lit.wgsl` — procedural materials and name plates.
 - `src/` — OpenXR host and LAN multiplayer.
 
-Sync source changes into the open Rive document with `tools/rive_mcp.py`,
-export using `bash tools/export_riv.sh`, then rebuild the APK.
-`bash tools/push.sh` supports faster scene-only iteration on a connected
-headset by enabling an external scene override.
+Sync changes into the open Rive document with `tools/rive_mcp.py`, export
+with `bash tools/export_riv.sh`, then rebuild the APK (or `bash tools/push.sh`
+for a scene-only push).
