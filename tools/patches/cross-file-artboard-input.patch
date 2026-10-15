@@ -1,0 +1,57 @@
+diff --git a/src/lua/lua_artboards.cpp b/src/lua/lua_artboards.cpp
+index 3fa52feb..155ce1a8 100644
+--- a/src/lua/lua_artboards.cpp
++++ b/src/lua/lua_artboards.cpp
+@@ -592,7 +592,15 @@ int ScriptedArtboard::pushData(lua_State* L)
+ int ScriptedArtboard::instance(lua_State* L,
+                                rcp<ViewModelInstance> viewModelInstance)
+ {
++    // Preserve authored default values when no explicit data is supplied.
++    // Blank generated instances zero bounds/counts used by scripted projects.
++    if (!viewModelInstance)
++    {
++        viewModelInstance = m_scriptReffedArtboard->file()
++            ->createDefaultViewModelInstance(artboard());
++    }
+     auto artboardInstance = artboard()->instance();
++    artboardInstance->file(ref_rcp(m_scriptReffedArtboard->file()));
+     artboardInstance->frameOrigin(false);
+     // Clones share the source's dependency on a cross-lifetime host file.
+     lua_newrive<ScriptedArtboard>(L,
+diff --git a/src/lua/lua_script_backend.cpp b/src/lua/lua_script_backend.cpp
+index 26d42236..bc2d20dc 100644
+--- a/src/lua/lua_script_backend.cpp
++++ b/src/lua/lua_script_backend.cpp
+@@ -923,14 +923,29 @@ void ScriptingVM::setInputArtboard(int selfRef,
+ {
+     lua_State* L = m_state;
+     rive_lua_pushRef(L, selfRef);
++    // External artboard inputs carry their own file's ViewModel definitions.
++    // Resolving them against the script owner's file binds unrelated data.
++    auto* inputFile = object->scriptAsset()->file();
++    if (artboard->isInstance())
++    {
++        auto sourceFile = static_cast<ArtboardInstance*>(artboard)->file();
++        if (sourceFile)
++        {
++            inputFile = const_cast<File*>(sourceFile.get());
++        }
++    }
+     auto artboardInstance = artboard->instance();
++    artboardInstance->file(ref_rcp(inputFile));
+     artboardInstance->frameOrigin(false);
+     lua_newrive<ScriptedArtboard>(L,
+                                   L,
+-                                  object->scriptAsset()->file(),
++                                  inputFile,
+                                   std::move(artboardInstance),
+-                                  nullptr,
+-                                  object->dataContext());
++                                  inputFile != object->scriptAsset()->file()
++                                      ? inputFile->createDefaultViewModelInstance(artboard)
++                                      : nullptr,
++                                  inputFile != object->scriptAsset()->file()
++                                      ? nullptr : object->dataContext());
+     lua_setfield(L, -2, name);
+     rive_lua_pop(L, 1);
+ }

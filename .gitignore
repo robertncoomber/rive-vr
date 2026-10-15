@@ -9,3 +9,4 @@ node_modules/
 web-harness/dist/
 third_party/openxr/
 assets_src/
+build-*/

@@ -10,6 +10,7 @@ DEST="/sdcard/Android/data/$PKG/files"
 
 adb shell mkdir -p "$DEST"
 adb push "$RIV" "$DEST/scene.riv" >/dev/null
+adb shell setprop debug.rivevr.external_scene 1
 adb shell am force-stop "$PKG"
 adb shell am start -n "$PKG/android.app.NativeActivity" >/dev/null
 echo "Pushed $(basename "$RIV") and restarted $PKG"

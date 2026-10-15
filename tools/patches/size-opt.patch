@@ -1,0 +1,41 @@
+diff --git a/build/rive_build_config.lua b/build/rive_build_config.lua
+index 1777a853..d1a617c8 100644
+--- a/build/rive_build_config.lua
++++ b/build/rive_build_config.lua
+@@ -67,6 +67,17 @@ newoption({
+     description = 'compile for android (supersedes --os)',
+ })
+ 
++newoption({
++    trigger = 'size_opt',
++    description = 'android: -Oz, no unwind tables or stack protector (requires -fno-exceptions)',
++})
++
++newoption({
++    trigger = 'opt_level',
++    value = 'LEVEL',
++    description = 'with --size_opt: optimization level instead of Oz (e.g. O2)',
++})
++
+ newoption({
+     trigger = 'android_api',
+     description = 'Target Android API version number',
+@@ -648,6 +659,18 @@ if _OPTIONS['for_android'] then
+         '-no-canonical-prefixes',
+     })
+ 
++    if _OPTIONS['size_opt'] then
++        -- buildoptions precede the toolset's -O flag, so remap the levels.
++        local level = '-' .. (_OPTIONS['opt_level'] or 'Oz')
++        premake.tools.gcc.shared.optimize.On = level
++        premake.tools.gcc.shared.optimize.Size = level
++        buildoptions({
++            '-fno-unwind-tables',
++            '-fno-asynchronous-unwind-tables',
++            '-fno-stack-protector',
++        })
++    end
++
+     linkoptions({
+         '--sysroot=' .. ndk_toolchain .. '/sysroot',
+         '-fdata-sections',
