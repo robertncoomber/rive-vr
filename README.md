@@ -66,3 +66,11 @@ every `debug.rivevr.*` property, refresh rates, and performance notes.
 Sync changes into the open Rive document with `tools/rive_mcp.py`, export
 with `bash tools/export_riv.sh`, then rebuild the APK (or `bash tools/push.sh`
 for a scene-only push).
+
+## License
+
+Our code is [0BSD](LICENSE). The APK also contains the Rive runtime, Luau,
+libhydrogen and Android's native_app_glue under their own permissive
+licenses; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+This is an independent project, not affiliated with or endorsed by Rive.
