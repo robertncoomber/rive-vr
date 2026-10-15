@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Minimal playground runtime: GPU Canvas + scripting, no text/layout/decoders.
-# --size_opt comes from tools/patches/size-opt.patch, applied here if missing.
+# Patches in tools/patches, applied here if missing:
+#   size-opt.patch        --size_opt
+#   ore-no-glfinish.patch drops a per-frame glFinish after Ore work
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-PATCH="$ROOT/tools/patches/size-opt.patch"
-if ! git -C "$ROOT/third_party/rive-runtime" apply --reverse --check "$PATCH" 2>/dev/null; then
-  git -C "$ROOT/third_party/rive-runtime" apply "$PATCH"
-fi
+for PATCH in "$ROOT/tools/patches/size-opt.patch" \
+             "$ROOT/tools/patches/ore-no-glfinish.patch"; do
+  if ! git -C "$ROOT/third_party/rive-runtime" apply --reverse --check "$PATCH" 2>/dev/null; then
+    git -C "$ROOT/third_party/rive-runtime" apply "$PATCH"
+  fi
+done
 cd "$ROOT/third_party/rive-runtime/renderer"
 # OPT=O2 (etc.) builds a speed variant into its own out dir; default is Oz.
 OPT="${OPT:-Oz}"

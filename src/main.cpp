@@ -10,6 +10,7 @@
 //  - Quad: anything else (the G3 gate file) is shown on a world-locked quad.
 
 #include <android/log.h>
+#include <android/asset_manager.h>
 #include <android_native_app_glue.h>
 #include <jni.h>
 #include <sys/system_properties.h>
@@ -21,13 +22,12 @@
 
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_OPENGL_ES
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
+#include "xr_loader.hpp"
 
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/artboard.hpp"
-#include "rive/file.hpp"
 #include "rive/lua/rive_lua_libs.hpp"
+#include "rive/file.hpp"
 #include "rive/lua/scripting_vm.hpp"
 #include "rive/renderer/cmd/deferred_host.hpp"
 #include "rive/renderer/cmd/deferred_session.hpp"
@@ -39,6 +39,7 @@
 
 #include "net.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <pthread.h>
 #include <unistd.h>
@@ -62,6 +63,17 @@
             return false;                                                      \
         }                                                                      \
     } while (0)
+
+// Replaces libc++abi's ~110 KB demangler. Its only caller is the terminate
+// handler, which prints the mangled exception type when this fails.
+extern "C" char* __cxa_demangle(const char*, char*, size_t*, int* status)
+{
+    if (status)
+    {
+        *status = -2;
+    }
+    return nullptr;
+}
 
 namespace
 {
@@ -153,6 +165,12 @@ struct App
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface pbuffer = EGL_NO_SURFACE;
     bool srgbWriteControl = false;
+    // GL_EXT_disjoint_timer_query, used to time each frame's replay on the GPU.
+    PFNGLGENQUERIESEXTPROC glGenQueriesEXT_ = nullptr;
+    PFNGLBEGINQUERYEXTPROC glBeginQueryEXT_ = nullptr;
+    PFNGLENDQUERYEXTPROC glEndQueryEXT_ = nullptr;
+    PFNGLGETQUERYOBJECTIVEXTPROC glGetQueryObjectivEXT_ = nullptr;
+    PFNGLGETQUERYOBJECTUI64VEXTPROC glGetQueryObjectui64vEXT_ = nullptr;
 
     // OpenXR
     XrInstance instance = XR_NULL_HANDLE;
@@ -166,6 +184,11 @@ struct App
     XrAction gripAction = XR_NULL_HANDLE;
     XrAction aimAction = XR_NULL_HANDLE;
     XrAction triggerAction = XR_NULL_HANDLE;
+    // Right controller A cycles the refresh rate, B toggles foveation; both
+    // buzz the controller to confirm.
+    XrAction rateAction = XR_NULL_HANDLE;
+    XrAction foveationAction = XR_NULL_HANDLE;
+    XrAction hapticAction = XR_NULL_HANDLE;
     XrPath handPaths[2] = {XR_NULL_PATH, XR_NULL_PATH};
     XrSpace gripSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
@@ -180,6 +203,21 @@ struct App
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
     bool hasPerfSettings = false;
+    bool hasRefreshRate = false;
+    // Every rate this headset can run, ascending (see loadRefreshRates).
+    std::vector<float> refreshRates;
+    size_t listedRateCount = 0;
+    // XR_FB_foveation + _configuration + XR_FB_swapchain_update_state.
+    int foveationExts = 0;
+    // Refresh rate and foveation level in use. They start from
+    // debug.rivevr.hz / debug.rivevr.ffr, the A/B buttons override them, and
+    // a later change to either property takes over again.
+    float appliedHz = 0;
+    float appliedFfr = 0;
+    float hzOverride = 0;
+    float ffrOverride = -1;
+    float hzProp = -1;
+    float ffrProp = -1;
     bool exitRequested = false;
 
     // Rive
@@ -212,6 +250,7 @@ struct App
     LanSession lan;
     bool lanUp = false;
     rive::ViewModelInstanceNumberRuntime* netOut[21] = {};
+    rive::ViewModelInstanceNumberRuntime* netColor = nullptr;
     rive::ViewModelInstanceNumberRuntime* remoteProps[kRemoteSlots][23] = {};
     jobject multicastLock = nullptr;
 
@@ -224,6 +263,16 @@ struct App
     uint64_t frameNumber = 0;
     uint32_t framesThisSecond = 0;
     double cpuMsThisSecond = 0;
+    // Per-phase ms summed over the second; see kPhaseNames.
+    double phaseMs[8] = {};
+    // GPU replay time from timer queries, read back kGpuQueries frames late.
+    static constexpr int kGpuQueries = 4;
+    GLuint gpuQueries[kGpuQueries] = {};
+    bool gpuQueryPending[kGpuQueries] = {};
+    double gpuMsThisSecond = 0;
+    double gpuMsMax = 0;
+    uint32_t gpuSamples = 0;
+    double frameMsMax = 0;
     std::chrono::steady_clock::time_point secondStart =
         std::chrono::steady_clock::now();
 };
@@ -289,6 +338,19 @@ bool initEGL(App& app)
     const char* exts = (const char*)glGetString(GL_EXTENSIONS);
     app.srgbWriteControl =
         exts != nullptr && strstr(exts, "GL_EXT_sRGB_write_control") != nullptr;
+    if (exts != nullptr && strstr(exts, "GL_EXT_disjoint_timer_query"))
+    {
+        app.glGenQueriesEXT_ =
+            (PFNGLGENQUERIESEXTPROC)eglGetProcAddress("glGenQueriesEXT");
+        app.glBeginQueryEXT_ =
+            (PFNGLBEGINQUERYEXTPROC)eglGetProcAddress("glBeginQueryEXT");
+        app.glEndQueryEXT_ =
+            (PFNGLENDQUERYEXTPROC)eglGetProcAddress("glEndQueryEXT");
+        app.glGetQueryObjectivEXT_ = (PFNGLGETQUERYOBJECTIVEXTPROC)
+            eglGetProcAddress("glGetQueryObjectivEXT");
+        app.glGetQueryObjectui64vEXT_ = (PFNGLGETQUERYOBJECTUI64VEXTPROC)
+            eglGetProcAddress("glGetQueryObjectui64vEXT");
+    }
     LOGI("GL_RENDERER=%s GL_VERSION=%s sRGB_write_control=%d",
          (const char*)glGetString(GL_RENDERER),
          (const char*)glGetString(GL_VERSION),
@@ -334,6 +396,106 @@ void applyPerformanceLevels(App& app)
          (int)cr);
 }
 
+// Rates this headset can run, ascending: what XR_FB_display_refresh_rate
+// enumerates, plus Quest 3's "extended" rates. Horizon OS 2.7+ accepts those
+// (240 also needs debug.oculus.forceDisplayScaling) but only enumerates up to
+// 120, and no other Quest has them.
+void loadRefreshRates(App& app,
+                      PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates)
+{
+    uint32_t count = 0;
+    enumerateRates(app.session, 0, &count, nullptr);
+    app.refreshRates.resize(count);
+    enumerateRates(app.session, count, &count, app.refreshRates.data());
+    app.listedRateCount = app.refreshRates.size();
+    char model[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.product.model", model);
+    if (strcmp(model, "Quest 3") == 0)
+    {
+        for (float rate : {144.0f, 165.0f, 185.0f, 207.0f})
+        {
+            app.refreshRates.push_back(rate);
+        }
+    }
+    std::sort(app.refreshRates.begin(), app.refreshRates.end());
+    std::string list;
+    for (float rate : app.refreshRates)
+    {
+        list += std::to_string((int)rate) + " ";
+    }
+    LOGI("Refresh rates for %s: %s(%zu listed by the runtime)",
+         model,
+         list.c_str(),
+         app.listedRateCount);
+}
+
+// Requests a display refresh rate via XR_FB_display_refresh_rate.
+// debug.rivevr.hz picks it (default 90), or the A button (hzOverride);
+// unsupported values fall back to the highest supported rate below them.
+void applyRefreshRate(App& app)
+{
+    if (!app.hasRefreshRate)
+    {
+        LOGI("XR_FB_display_refresh_rate not available");
+        return;
+    }
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB requestRate = nullptr;
+    if (XR_FAILED(xrGetInstanceProcAddr(app.instance,
+                                        "xrEnumerateDisplayRefreshRatesFB",
+                                        (PFN_xrVoidFunction*)&enumerateRates)) ||
+        XR_FAILED(xrGetInstanceProcAddr(app.instance,
+                                        "xrRequestDisplayRefreshRateFB",
+                                        (PFN_xrVoidFunction*)&requestRate)) ||
+        enumerateRates == nullptr || requestRate == nullptr)
+    {
+        return;
+    }
+    if (app.refreshRates.empty())
+    {
+        loadRefreshRates(app, enumerateRates);
+    }
+
+    const float wanted = app.hzOverride > 0
+                             ? app.hzOverride
+                             : sysPropFloat("debug.rivevr.hz", 90.0f);
+    float chosen = 0.0f;
+    float listed = 0.0f;
+    for (float rate : app.refreshRates)
+    {
+        if (rate <= wanted + 0.5f)
+        {
+            chosen = rate;
+        }
+    }
+    for (float rate : app.refreshRates)
+    {
+        // The runtime's own rates are all <= 120, extended ones above.
+        if (rate <= 120.5f && rate <= wanted + 0.5f)
+        {
+            listed = rate;
+        }
+    }
+    if (chosen == 0.0f)
+    {
+        LOGI("Refresh rate: none <= %.0f Hz", wanted);
+        return;
+    }
+    XrResult result = requestRate(app.session, chosen);
+    if (XR_FAILED(result) && listed > 0.0f && listed != chosen)
+    {
+        // Extended rate refused (e.g. Horizon OS before 2.7).
+        LOGI("Refresh rate: %.0f Hz refused (result %d)", chosen, (int)result);
+        chosen = listed;
+        result = requestRate(app.session, chosen);
+    }
+    app.appliedHz = chosen;
+    LOGI("Refresh rate: wanted %.0f -> requested %.0f Hz (result %d)",
+         wanted,
+         chosen,
+         (int)result);
+}
+
 bool initInput(App& app)
 {
     for (int hand = 0; hand < 2; ++hand)
@@ -360,6 +522,15 @@ bool initInput(App& app)
     XR_CHECK(makeAction("aim_pose", XR_ACTION_TYPE_POSE_INPUT, &app.aimAction));
     XR_CHECK(
         makeAction("trigger", XR_ACTION_TYPE_FLOAT_INPUT, &app.triggerAction));
+    XR_CHECK(makeAction("cycle_rate",
+                        XR_ACTION_TYPE_BOOLEAN_INPUT,
+                        &app.rateAction));
+    XR_CHECK(makeAction("toggle_foveation",
+                        XR_ACTION_TYPE_BOOLEAN_INPUT,
+                        &app.foveationAction));
+    XR_CHECK(makeAction("haptic",
+                        XR_ACTION_TYPE_VIBRATION_OUTPUT,
+                        &app.hapticAction));
 
     auto path = [&](const char* str) {
         XrPath p = XR_NULL_PATH;
@@ -373,6 +544,9 @@ bool initInput(App& app)
         {app.aimAction, path("/user/hand/right/input/aim/pose")},
         {app.triggerAction, path("/user/hand/left/input/trigger/value")},
         {app.triggerAction, path("/user/hand/right/input/trigger/value")},
+        {app.rateAction, path("/user/hand/right/input/a/click")},
+        {app.foveationAction, path("/user/hand/right/input/b/click")},
+        {app.hapticAction, path("/user/hand/right/output/haptic")},
     };
     XrInteractionProfileSuggestedBinding suggested{
         XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -403,17 +577,71 @@ bool initInput(App& app)
     return true;
 }
 
+// True on the frame a right-hand button goes down.
+bool pressed(App& app, XrAction action)
+{
+    XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+    getInfo.action = action;
+    getInfo.subactionPath = app.handPaths[1];
+    XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+    xrGetActionStateBoolean(app.session, &getInfo, &state);
+    return state.isActive && state.changedSinceLastSync && state.currentState;
+}
+
+void buzz(App& app, float amplitude)
+{
+    XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+    info.action = app.hapticAction;
+    info.subactionPath = app.handPaths[1];
+    XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+    vibration.duration = 60000000; // 60 ms
+    vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+    vibration.amplitude = amplitude;
+    xrApplyHapticFeedback(app.session,
+                          &info,
+                          (const XrHapticBaseHeader*)&vibration);
+}
+
+void applyRefreshRate(App& app);
+void applyFoveationFB(App& app);
+
+// A steps up through this headset's refresh rates (wrapping to the
+// lowest), with a stronger buzz for higher rates. B toggles foveation between off and high.
+void handleTuningButtons(App& app)
+{
+    if (pressed(app, app.rateAction))
+    {
+        const std::vector<float>& rates = app.refreshRates;
+        if (!rates.empty())
+        {
+            size_t next = 0;
+            for (size_t i = 0; i < rates.size(); ++i)
+            {
+                if (rates[i] > app.appliedHz + 0.5f)
+                {
+                    next = i;
+                    break;
+                }
+            }
+            app.hzOverride = rates[next];
+            applyRefreshRate(app);
+            buzz(app,
+                 rates.size() > 1 ? 0.2f + 0.8f * next / (rates.size() - 1)
+                                  : 1.0f);
+        }
+    }
+    if (pressed(app, app.foveationAction))
+    {
+        app.ffrOverride = app.appliedFfr > 0 ? 0.0f : 3.0f;
+        applyFoveationFB(app);
+        buzz(app, app.ffrOverride > 0 ? 1.0f : 0.3f);
+    }
+}
+
 bool initOpenXR(App& app)
 {
-    PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
-    XR_CHECK(
-        xrGetInstanceProcAddr(XR_NULL_HANDLE,
-                              "xrInitializeLoaderKHR",
-                              (PFN_xrVoidFunction*)&initializeLoader));
-    XrLoaderInitInfoAndroidKHR loaderInit{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
-    loaderInit.applicationVM = app.android->activity->vm;
-    loaderInit.applicationContext = app.android->activity->clazz;
-    XR_CHECK(initializeLoader((const XrLoaderInitInfoBaseHeaderKHR*)&loaderInit));
+    XR_CHECK(xrLoaderInitialize(app.android->activity->vm,
+                                app.android->activity->clazz));
 
     // Optional: XR_EXT_performance_settings lets us ask for higher CPU/GPU
     // clock levels (see applyPerformanceLevels).
@@ -433,6 +661,19 @@ bool initOpenXR(App& app)
         {
             app.hasPerfSettings = true;
         }
+        if (strcmp(ext.extensionName,
+                   XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+        {
+            app.hasRefreshRate = true;
+        }
+        if (strcmp(ext.extensionName, XR_FB_FOVEATION_EXTENSION_NAME) == 0 ||
+            strcmp(ext.extensionName,
+                   XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME) == 0 ||
+            strcmp(ext.extensionName,
+                   XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME) == 0)
+        {
+            app.foveationExts++;
+        }
     }
     std::vector<const char*> extensions = {
         XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
@@ -440,6 +681,16 @@ bool initOpenXR(App& app)
     if (app.hasPerfSettings)
     {
         extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    }
+    if (app.hasRefreshRate)
+    {
+        extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    }
+    if (app.foveationExts == 3)
+    {
+        extensions.push_back(XR_FB_FOVEATION_EXTENSION_NAME);
+        extensions.push_back(XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME);
+        extensions.push_back(XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME);
     }
     XrInstanceCreateInfoAndroidKHR androidInfo{
         XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -456,6 +707,7 @@ bool initOpenXR(App& app)
     createInfo.applicationInfo.engineVersion = 1;
     createInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     XR_CHECK(xrCreateInstance(&createInfo, &app.instance));
+    XR_CHECK(xrLoaderLoadInstanceFunctions(app.instance));
 
     XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(app.instance, &props);
@@ -492,6 +744,7 @@ bool initOpenXR(App& app)
     sessionInfo.systemId = app.systemId;
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     applyPerformanceLevels(app);
+    applyRefreshRate(app);
 
     XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -544,6 +797,55 @@ bool initOpenXR(App& app)
     return true;
 }
 
+// Applies Meta's fixed foveated rendering to the swapchain through
+// XR_FB_foveation. debug.rivevr.ffr picks the level: 0 off, 1 low,
+// 2 medium, 3 high (default).
+void applyFoveationFB(App& app)
+{
+    app.appliedFfr = app.ffrOverride >= 0
+                         ? app.ffrOverride
+                         : sysPropFloat("debug.rivevr.ffr", 3.0f);
+    const int level = (int)app.appliedFfr;
+    if (app.foveationExts != 3)
+    {
+        LOGI("XR_FB_foveation not available (exts %d)", app.foveationExts);
+        return;
+    }
+    PFN_xrCreateFoveationProfileFB createProfile = nullptr;
+    PFN_xrDestroyFoveationProfileFB destroyProfile = nullptr;
+    PFN_xrUpdateSwapchainFB updateSwapchain = nullptr;
+    xrGetInstanceProcAddr(app.instance,
+                          "xrCreateFoveationProfileFB",
+                          (PFN_xrVoidFunction*)&createProfile);
+    xrGetInstanceProcAddr(app.instance,
+                          "xrDestroyFoveationProfileFB",
+                          (PFN_xrVoidFunction*)&destroyProfile);
+    xrGetInstanceProcAddr(app.instance,
+                          "xrUpdateSwapchainFB",
+                          (PFN_xrVoidFunction*)&updateSwapchain);
+    if (!createProfile || !destroyProfile || !updateSwapchain)
+    {
+        LOGE("XR_FB_foveation functions missing");
+        return;
+    }
+    XrFoveationLevelProfileCreateInfoFB levelInfo{
+        XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
+    levelInfo.level = (XrFoveationLevelFB)(level < 0 ? 0 : (level > 3 ? 3 : level));
+    levelInfo.verticalOffset = 0;
+    levelInfo.dynamic = XR_FOVEATION_DYNAMIC_DISABLED_FB;
+    XrFoveationProfileCreateInfoFB profileInfo{
+        XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB};
+    profileInfo.next = &levelInfo;
+    XrFoveationProfileFB profile = XR_NULL_HANDLE;
+    XrResult cr = createProfile(app.session, &profileInfo, &profile);
+    XrSwapchainStateFoveationFB state{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB};
+    state.profile = profile;
+    XrResult ur =
+        updateSwapchain(app.swapchain, (XrSwapchainStateBaseHeaderFB*)&state);
+    destroyProfile(profile);
+    LOGI("XR_FB_foveation level %d: create %d, update %d", level, cr, ur);
+}
+
 bool createSwapchain(App& app, uint32_t width, uint32_t height)
 {
     // Swapchain format: sRGB by default (what the Quest compositor expects).
@@ -592,6 +894,7 @@ bool createSwapchain(App& app, uint32_t width, uint32_t height)
         (XrSwapchainImageBaseHeader*)app.images.data()));
     app.swapchainWidth = width;
     app.swapchainHeight = height;
+    applyFoveationFB(app);
     app.renderTarget =
         rive::make_rcp<rive::gpu::TextureRenderTargetGL>(width, height);
     // GL Ore can only wrap a top-down target; the script flips its
@@ -662,13 +965,37 @@ bool initRive(App& app)
     LOGI("Render path: %s, msaa %d", app.direct ? "direct" : "canvas", app.msaa);
     app.host.bindSession(app.riveSession.get(), app.target);
 
-    const std::string path =
-        std::string(app.android->activity->externalDataPath) + "/scene.riv";
+    // Standalone APK: the current playground ships as its only content asset.
+    // Development overrides are explicit so an old pushed scene cannot replace
+    // the newly installed build (or resurrect removed sample dependencies).
+    const std::string path = "assets/scene.riv";
     std::vector<uint8_t> bytes;
-    if (!readFile(path, bytes))
+    if (sysPropEnabled("debug.rivevr.external_scene", false))
     {
-        LOGE("Could not read %s (push one with tools/push.sh)", path.c_str());
-        return false;
+        const auto overridePath = std::string(app.android->activity->externalDataPath) + "/scene.riv";
+        if (!readFile(overridePath, bytes))
+        {
+            LOGE("Could not read external scene override");
+            return false;
+        }
+    }
+    else
+    {
+        AAsset* asset = AAssetManager_open(app.android->activity->assetManager,
+                                          "scene.riv", AASSET_MODE_BUFFER);
+        if (!asset)
+        {
+            LOGE("APK is missing assets/scene.riv");
+            return false;
+        }
+        bytes.resize(AAsset_getLength(asset));
+        const int count = AAsset_read(asset, bytes.data(), bytes.size());
+        AAsset_close(asset);
+        if (count < 0 || static_cast<size_t>(count) != bytes.size())
+        {
+            LOGE("Could not read packaged scene");
+            return false;
+        }
     }
     // Our own scripting VM so scripts get a 5 s budget per call instead of the
     // runtime's default 200 ms (decoding a model at init needs more).
@@ -768,6 +1095,7 @@ bool initRive(App& app)
                     std::string("net") + kNetParts[part] + "_" + kControllerPoseKeys[k]);
             }
         }
+        app.netColor = app.viewModel->propertyNumber("netColor");
         for (int slot = 0; slot < kRemoteSlots; ++slot)
         {
             const std::string p = "p" + std::to_string(slot + 1) + "_";
@@ -783,7 +1111,7 @@ bool initRive(App& app)
                 }
             }
         }
-        int missing = 0;
+        int missing = app.netColor == nullptr;
         for (auto* prop : app.netOut)
             missing += prop == nullptr;
         for (auto& slot : app.remoteProps)
@@ -791,7 +1119,7 @@ bool initRive(App& app)
                 missing += prop == nullptr;
         LOGI("Multiplayer ViewModel properties: %d of %d missing",
              missing,
-             21 + kRemoteSlots * 23);
+             22 + kRemoteSlots * 23);
         setNumber(app, "msaa", (float)app.msaa);
         setNumber(app, "direct", app.direct ? 1.0f : 0.0f);
         // The artboard is the double-wide eye image, pixel for pixel.
@@ -870,6 +1198,8 @@ double monotonicSeconds()
 // Remote players, interpolated, into the XR ViewModel slots.
 void writeRemotePlayers(App& app)
 {
+    // Our own colour, as peers pick it from our id; -1 while offline.
+    setProp(app.netColor, app.lanUp ? (float)(app.lan.id() % 8) : -1.0f);
     if (!app.lanUp)
     {
         return;
@@ -974,6 +1304,7 @@ void writeControllers(App& app, XrTime displayTime)
     syncInfo.countActiveActionSets = 1;
     syncInfo.activeActionSets = &active;
     xrSyncActions(app.session, &syncInfo);
+    handleTuningButtons(app);
 
     for (int hand = 0; hand < 2; ++hand)
     {
@@ -1066,8 +1397,23 @@ bool writeEyePoses(App& app, XrTime displayTime)
     return true;
 }
 
+// Phases timed inside renderFrame. "rive cpu" is everything after waitFrame.
+enum Phase
+{
+    kWaitFrame, // xrWaitFrame + xrBeginFrame (not in rive cpu)
+    kInput,     // eye/controller/remote poses into the ViewModel
+    kAdvance,   // state machine advance (Luau scripts' advance)
+    kRecord,    // artboard draw into the deferred session
+    kAcquire,   // xrAcquireSwapchainImage + xrWaitSwapchainImage
+    kReplay,    // replayInline + flush (GL command submission)
+    kEndFrame,  // xrReleaseSwapchainImage + xrEndFrame
+    kPhaseCount
+};
+const char* const kPhaseNames[kPhaseCount] =
+    {"wait", "in", "adv", "rec", "acq", "rep", "end"};
+
 // Records this frame's artboard into the deferred session.
-void recordRive(App& app, float dt)
+template <typename Lap> void recordRive(App& app, float dt, Lap& lap)
 {
     if (app.stateMachine)
     {
@@ -1077,6 +1423,7 @@ void recordRive(App& app, float dt)
     {
         app.artboard->advance(dt);
     }
+    lap(kAdvance);
 
     app.riveSession->beginTargetFrame(app.target);
     rive::ore::Context::TargetDesc targetDesc;
@@ -1130,8 +1477,46 @@ bool replayRive(App& app, GLuint texture)
     });
 }
 
+void readGpuQuery(App& app, int slot)
+{
+    if (!app.gpuQueryPending[slot])
+    {
+        return;
+    }
+    GLint available = 0;
+    app.glGetQueryObjectivEXT_(app.gpuQueries[slot],
+                               GL_QUERY_RESULT_AVAILABLE_EXT,
+                               &available);
+    if (!available)
+    {
+        return;
+    }
+    GLuint64 ns = 0;
+    app.glGetQueryObjectui64vEXT_(app.gpuQueries[slot],
+                                  GL_QUERY_RESULT_EXT,
+                                  &ns);
+    app.gpuQueryPending[slot] = false;
+    GLint disjoint = 0;
+    glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    if (disjoint)
+    {
+        return;
+    }
+    const double ms = ns * 1e-6;
+    app.gpuMsThisSecond += ms;
+    app.gpuMsMax = std::max(app.gpuMsMax, ms);
+    app.gpuSamples++;
+}
+
 void renderFrame(App& app)
 {
+    auto phaseClock = std::chrono::steady_clock::now();
+    auto lap = [&](Phase phase) {
+        const auto t = std::chrono::steady_clock::now();
+        app.phaseMs[phase] +=
+            std::chrono::duration<double, std::milli>(t - phaseClock).count();
+        phaseClock = t;
+    };
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState{XR_TYPE_FRAME_STATE};
     if (XR_FAILED(xrWaitFrame(app.session, &waitInfo, &frameState)))
@@ -1140,6 +1525,7 @@ void renderFrame(App& app)
     }
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
     xrBeginFrame(app.session, &beginInfo);
+    lap(kWaitFrame);
 
     const auto cpuStart = std::chrono::steady_clock::now();
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -1169,12 +1555,14 @@ void renderFrame(App& app)
             writeControllers(app, frameState.predictedDisplayTime);
             writeRemotePlayers(app);
         }
+        lap(kInput);
 
-        recordRive(app, dt);
+        recordRive(app, dt, lap);
         if (app.stereo)
         {
             sendLocalPose(app);
         }
+        lap(kRecord);
 
         if (app.stereo && app.seenFrameProp != nullptr)
         {
@@ -1192,7 +1580,23 @@ void renderFrame(App& app)
         XrSwapchainImageWaitInfo imageWait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         imageWait.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain, &imageWait);
+        lap(kAcquire);
 
+        const bool gpuTimer = app.glGenQueriesEXT_ != nullptr;
+        const int slot = (int)(app.frameNumber % App::kGpuQueries);
+        if (gpuTimer)
+        {
+            if (app.gpuQueries[0] == 0)
+            {
+                app.glGenQueriesEXT_(App::kGpuQueries, app.gpuQueries);
+            }
+            readGpuQuery(app, slot);
+            if (!app.gpuQueryPending[slot])
+            {
+                app.glBeginQueryEXT_(GL_TIME_ELAPSED_EXT, app.gpuQueries[slot]);
+            }
+        }
+        const bool timing = gpuTimer && !app.gpuQueryPending[slot];
         if (!replayRive(app, app.images[index].image))
         {
             static bool warned = false;
@@ -1202,6 +1606,12 @@ void renderFrame(App& app)
                 warned = true;
             }
         }
+        if (timing)
+        {
+            app.glEndQueryEXT_(GL_TIME_ELAPSED_EXT);
+            app.gpuQueryPending[slot] = true;
+        }
+        lap(kReplay);
 
         XrSwapchainImageReleaseInfo releaseInfo{
             XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -1251,10 +1661,13 @@ void renderFrame(App& app)
     endInfo.layerCount = layerCount;
     endInfo.layers = layers;
     xrEndFrame(app.session, &endInfo);
+    lap(kEndFrame);
 
     const auto now = std::chrono::steady_clock::now();
-    app.cpuMsThisSecond +=
+    const double cpuMs =
         std::chrono::duration<double, std::milli>(now - cpuStart).count();
+    app.cpuMsThisSecond += cpuMs;
+    app.frameMsMax = std::max(app.frameMsMax, cpuMs);
     app.framesThisSecond++;
     const double elapsed =
         std::chrono::duration<double>(now - app.secondStart).count();
@@ -1276,8 +1689,55 @@ void renderFrame(App& app)
              (unsigned long long)app.g4Frames,
              handState(0).c_str(),
              handState(1).c_str());
+        char phases[256];
+        int len = 0;
+        for (int p = 0; p < kPhaseCount; ++p)
+        {
+            len += snprintf(phases + len,
+                            sizeof(phases) - len,
+                            "%s=%.2f ",
+                            kPhaseNames[p],
+                            app.phaseMs[p] / app.framesThisSecond);
+            app.phaseMs[p] = 0;
+        }
+        LOGI("phases ms/frame: %s| cpu max=%.2f | gpu replay avg=%.2f max=%.2f "
+             "(n=%u)",
+             phases,
+             app.frameMsMax,
+             app.gpuSamples ? app.gpuMsThisSecond / app.gpuSamples : 0.0,
+             app.gpuMsMax,
+             app.gpuSamples);
+        app.gpuMsThisSecond = 0;
+        app.gpuMsMax = 0;
+        app.gpuSamples = 0;
+        app.frameMsMax = 0;
         app.framesThisSecond = 0;
         app.cpuMsThisSecond = 0;
+
+        // Live tuning: adb shell setprop debug.rivevr.hz 165 (or .ffr 2)
+        // takes effect within a second, no restart.
+        const float hzProp = sysPropFloat("debug.rivevr.hz", 90.0f);
+        if (hzProp != app.hzProp)
+        {
+            const bool first = app.hzProp < 0;
+            app.hzProp = hzProp;
+            if (!first)
+            {
+                app.hzOverride = 0;
+                applyRefreshRate(app);
+            }
+        }
+        const float ffrProp = sysPropFloat("debug.rivevr.ffr", 3.0f);
+        if (ffrProp != app.ffrProp)
+        {
+            const bool first = app.ffrProp < 0;
+            app.ffrProp = ffrProp;
+            if (!first)
+            {
+                app.ffrOverride = -1;
+                applyFoveationFB(app);
+            }
+        }
         app.secondStart = now;
     }
 }

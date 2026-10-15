@@ -40,6 +40,8 @@
     X(xrEnumerateSwapchainImages)                                              \
     X(xrEnumerateViewConfigurationViews)                                       \
     X(xrGetActionStateFloat)                                                   \
+    X(xrGetActionStateBoolean)                                                 \
+    X(xrApplyHapticFeedback)                                                   \
     X(xrGetInstanceProperties)                                                 \
     X(xrGetSystem)                                                             \
     X(xrGetSystemProperties)                                                   \

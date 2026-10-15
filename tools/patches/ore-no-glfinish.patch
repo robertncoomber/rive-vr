@@ -1,0 +1,19 @@
+diff --git a/renderer/src/gl/render_context_gl_impl.cpp b/renderer/src/gl/render_context_gl_impl.cpp
+index ea30e11d..9559ff2f 100644
+--- a/renderer/src/gl/render_context_gl_impl.cpp
++++ b/renderer/src/gl/render_context_gl_impl.cpp
+@@ -664,11 +664,9 @@ void RenderContextGLImpl::invalidateGLState()
+ 
+ void RenderContextGLImpl::scrubStateAfterOre()
+ {
+-#ifndef RIVE_WEBGL
+-    // Ore's FBO work must land before we render through it. WebGL replays
+-    // both on one context, which already orders them.
+-    glFinish();
+-#endif
++    // No glFinish here: Ore and Rive share this GL context, so GL's command
++    // order already lands Ore's FBO work before we render through it. A
++    // glFinish stalled the CPU on the GPU every frame (~9 ms on Quest).
+ 
+     for (int i = 0; i <= DEFAULT_BINDINGS_SET_SIZE; ++i)
+     {
