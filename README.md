@@ -1,5 +1,7 @@
 # Rive VR
 
+![Another player in the grove, rendered by Rive on Quest](docs/demo.gif)
+
 A small, standalone Meta Quest playground built to explore **Rive as a VR
 rendering and gameplay runtime**. The current APK is about **800 KB**,
 including the scene, and runs at up to **207 Hz** on Quest 3.
